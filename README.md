@@ -2,9 +2,9 @@
 
 AirDrop-like file send on [Iroh](https://iroh.computer). A background **agent** stays
 discoverable; a small **TUI** attaches to it. Nearby devices meet on the LAN
-(multicast + HTTP subnet scan + mDNS). After accept, bytes go over `iroh-blobs`
-on magicsock so the same transfer can keep going when Wi-Fi drops (hole punch,
-then n0 relay).
+(multicast + HTTP subnet scan + mDNS) or over **Bluetooth** (GATT Presence
+handshake). After accept, bytes go over `iroh-blobs` on magicsock so the same
+transfer can keep going when Wi-Fi drops (hole punch, then n0 relay).
 
 Not LocalSend-compatible. No system VPN.
 
@@ -24,7 +24,7 @@ cargo build -p omashare --release
 ./target/release/omashare send photo.jpg --to other-laptop
 ```
 
-Incoming files go to `~/Downloads/omashare`. `--offline` skips n0 relays (LAN only). `--pin 1234` requires senders to pass that PIN. `--auto-accept` is for kiosks and tests only.
+Incoming files go to `~/Downloads/omashare`. `--offline` skips n0 relays (LAN only). `--pin 1234` requires senders to pass that PIN. `--auto-accept` is for kiosks and tests only. `--no-ble` skips Bluetooth discovery (BlueZ).
 
 The TUI opens the native file manager (xdg-desktop-portal, then zenity) for **s** / search. It does not browse files itself.
 
@@ -50,5 +50,7 @@ cargo run -p omashare-ffi --bin uniffi-bindgen -- generate \
 ## Protocol
 
 - Discovery UDP/TCP port **53318**, multicast `224.0.0.169`, HTTP `GET /omashare/info`
+- BLE discovery: service UUID `6f6d6173-6861-7265-0000-000000005318`, GATT
+  Presence JSON on `…5319`. Handshake only; files still go LAN / WAN / n0 relay.
 - Offer ALPN `omashare/offer/0`
 - Payload ALPN `iroh-blobs`

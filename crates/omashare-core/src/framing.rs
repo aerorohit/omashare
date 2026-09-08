@@ -34,10 +34,8 @@ pub mod quinn_write {
     use iroh::endpoint::{RecvStream, SendStream};
 
     pub trait WriteBytes {
-        fn write_all(
-            &mut self,
-            buf: &[u8],
-        ) -> impl std::future::Future<Output = Result<()>> + Send;
+        fn write_all(&mut self, buf: &[u8])
+            -> impl std::future::Future<Output = Result<()>> + Send;
     }
 
     pub trait ReadBytes {

@@ -14,6 +14,15 @@ pub const DISCOVERY_PORT: u16 = 53318;
 
 pub const DNS_SD_SERVICE: &str = "_omashare._udp.local.";
 
+/// BLE GATT service. Advertisements carry this UUID only (31-byte ads cannot
+/// hold an EndpointId). Full [`Presence`] is a GATT read of
+/// [`BLE_PRESENCE_CHAR_UUID`].
+pub const BLE_SERVICE_UUID: &str = "6f6d6173-6861-7265-0000-000000005318";
+
+/// BLE GATT characteristic (read): UTF-8 JSON [`Presence`], including home
+/// relay URLs so iroh can dial WAN/relay after a Bluetooth handshake.
+pub const BLE_PRESENCE_CHAR_UUID: &str = "6f6d6173-6861-7265-0000-000000005319";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
@@ -36,8 +45,8 @@ pub struct Presence {
     /// Iroh endpoint id, base32.
     pub endpoint_id: String,
     pub pin_required: bool,
-    /// Direct Iroh UDP addresses (`ip:port`) so peers can connect on LAN
-    /// without relays. Discovery HTTP used to advertise only the info port.
+    /// Direct Iroh UDP addresses (`ip:port`) and home relay URLs so peers can
+    /// connect on LAN or via WAN/relay after BLE/HTTP discovery.
     #[serde(default)]
     pub addrs: Vec<String>,
 }

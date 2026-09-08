@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use futures_util::StreamExt;
-use omashare_core::events::NearbyPeer;
+use omashare_core::events::{DiscoverySource, NearbyPeer};
 use omashare_core::protocol::{DeviceKind, FileOffer};
 use omashare_core::{NodeEvent, TransferPath};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -118,7 +118,10 @@ impl Ui {
                     }
                 }
             }
-            NodeEvent::TransferComplete { session_id, saved_to } => {
+            NodeEvent::TransferComplete {
+                session_id,
+                saved_to,
+            } => {
                 self.inbox.retain(|o| o.session_id != session_id);
                 self.progress = None;
                 self.status = match saved_to {
@@ -316,7 +319,8 @@ fn draw(frame: &mut Frame, ui: &Ui) {
             .map(|(i, p)| {
                 let mark = if i == ui.selected { "●" } else { " " };
                 let kind = kind_label(p.device_kind);
-                ListItem::new(format!("{mark} {:<18} {kind}", p.alias))
+                let src = source_label(p.source);
+                ListItem::new(format!("{mark} {:<18} {kind:<8} {src}", p.alias))
             })
             .collect()
     };
@@ -405,6 +409,15 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+fn source_label(source: DiscoverySource) -> &'static str {
+    match source {
+        DiscoverySource::Bluetooth => "bt",
+        DiscoverySource::Mdns | DiscoverySource::NativeDnsSd => "mdns",
+        DiscoverySource::Multicast | DiscoverySource::SubnetScan => "lan",
+        DiscoverySource::Manual => "",
+    }
 }
 
 fn kind_label(kind: DeviceKind) -> &'static str {

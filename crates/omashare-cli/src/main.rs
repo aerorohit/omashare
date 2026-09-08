@@ -4,6 +4,9 @@ mod listen;
 mod picker;
 mod tui;
 
+#[cfg(target_os = "linux")]
+mod ble;
+
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +34,8 @@ struct Cli {
     no_mdns: bool,
     #[arg(long)]
     no_scan: bool,
+    #[arg(long)]
+    no_ble: bool,
     #[arg(long)]
     offline: bool,
     #[arg(long)]
@@ -76,7 +81,11 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let filter = if cli.verbose { "omashare=debug" } else { "omashare=info" };
+    let filter = if cli.verbose {
+        "omashare=debug"
+    } else {
+        "omashare=info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive(filter.parse()?),
@@ -89,6 +98,7 @@ async fn main() -> Result<()> {
             agent::run_agent(agent::AgentOpts {
                 config,
                 auto_accept: cli.auto_accept,
+                enable_ble: !cli.no_ble,
             })
             .await?;
         }
@@ -185,9 +195,12 @@ async fn run_tui(config: NodeConfig) -> Result<()> {
     let embedded = agent::spawn_embedded_agent(agent::AgentOpts {
         config,
         auto_accept: false,
+        enable_ble: true,
     })
     .await?;
-    let client = IpcClient::connect().await.context("attach to in-process node")?;
+    let client = IpcClient::connect()
+        .await
+        .context("attach to in-process node")?;
     let result = tui::run(client).await;
     embedded.shutdown().await;
     result
@@ -200,9 +213,12 @@ async fn run_listen(config: NodeConfig) -> Result<()> {
     let embedded = agent::spawn_embedded_agent(agent::AgentOpts {
         config,
         auto_accept: false,
+        enable_ble: true,
     })
     .await?;
-    let client = IpcClient::connect().await.context("attach to in-process node")?;
+    let client = IpcClient::connect()
+        .await
+        .context("attach to in-process node")?;
     let result = listen::run(client).await;
     embedded.shutdown().await;
     result

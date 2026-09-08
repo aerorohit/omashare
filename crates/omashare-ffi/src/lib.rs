@@ -81,19 +81,17 @@ impl OmashareNode {
             .map_err(|e| OmashareError::Start(e.to_string()))?;
         let node = Arc::new(node);
         let mut ev = node.subscribe();
-        thread::spawn(move || {
-            loop {
-                match ev.blocking_recv() {
-                    Ok(event) => {
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            listener.on_event_json(json);
-                        }
+        thread::spawn(move || loop {
+            match ev.blocking_recv() {
+                Ok(event) => {
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        listener.on_event_json(json);
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("event listener lagged, skipped {n}");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("event listener lagged, skipped {n}");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         });
         *self.node.lock().unwrap() = Some(node);
@@ -101,19 +99,16 @@ impl OmashareNode {
     }
 
     pub fn endpoint_id(&self) -> String {
-        self.with_node(|n| n.endpoint_id())
-            .unwrap_or_default()
+        self.with_node(|n| n.endpoint_id()).unwrap_or_default()
     }
 
     pub fn nearby_json(&self) -> String {
-        let peers = self
-            .rt
-            .block_on(async {
-                match self.node.lock().unwrap().clone() {
-                    Some(n) => n.nearby().await,
-                    None => vec![],
-                }
-            });
+        let peers = self.rt.block_on(async {
+            match self.node.lock().unwrap().clone() {
+                Some(n) => n.nearby().await,
+                None => vec![],
+            }
+        });
         serde_json::to_string(&peers).unwrap_or_else(|_| "[]".into())
     }
 
@@ -123,13 +118,29 @@ impl OmashareNode {
         endpoint_id: String,
         addrs: Vec<String>,
         pin_required: bool,
+        source: String,
+        device_kind: String,
     ) {
+        let source = match source.as_str() {
+            "bluetooth" => DiscoverySource::Bluetooth,
+            "manual" => DiscoverySource::Manual,
+            "mdns" => DiscoverySource::Mdns,
+            "multicast" => DiscoverySource::Multicast,
+            "subnet_scan" => DiscoverySource::SubnetScan,
+            _ => DiscoverySource::NativeDnsSd,
+        };
+        let device_kind = match device_kind.as_str() {
+            "mobile" => DeviceKind::Mobile,
+            "desktop" => DeviceKind::Desktop,
+            "headless" => DeviceKind::Headless,
+            _ => DeviceKind::Unknown,
+        };
         let peer = NearbyPeer {
             alias,
-            device_kind: DeviceKind::Unknown,
+            device_kind,
             endpoint_id,
             pin_required,
-            source: DiscoverySource::NativeDnsSd,
+            source,
             addrs,
         };
         self.rt.block_on(async {
@@ -160,7 +171,12 @@ impl OmashareNode {
         })
     }
 
-    pub fn send_file(&self, peer_id: String, path: String, pin: Option<String>) -> Result<String, OmashareError> {
+    pub fn send_file(
+        &self,
+        peer_id: String,
+        path: String,
+        pin: Option<String>,
+    ) -> Result<String, OmashareError> {
         self.send_files(peer_id, vec![path], pin)
     }
 

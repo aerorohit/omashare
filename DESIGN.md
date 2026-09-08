@@ -13,6 +13,8 @@ Sample CLI + core (`omashare-core`, `omashare-cli`, `omashare-ffi`):
 
 - LAN discovery: UDP multicast `224.0.0.169:53318`, HTTP `GET /omashare/info`,
   optional subnet scan, mDNS `_omashare._udp.local.`
+- BLE discovery: advertise service UUID `6f6d6173-6861-7265-0000-000000005318`,
+  GATT read of Presence JSON on `…5319`, then iroh WAN/relay (not bytes over BLE).
 - Offer/consent over Iroh ALPN `omashare/offer/0` (`Offer` / `Accept` / `Decline` / `Cancel`)
 - Bytes over `iroh-blobs` (resume, magicsock, optional n0 relay)
 - Commands: `listen` (REPL), `daemon` (auto-accept), `send FILE`
@@ -27,8 +29,8 @@ Not LocalSend-compatible. Not AirDrop-compatible. Same *shape* as both.
 - A **daemon** (`sharingd`) is always listening. The picker is not the node.
 - Flow: discover → **Ask** (metadata) → human accept/decline → upload.
 - Receiver never needs to “start receive mode.”
-- We will not implement BLE wake or AWDL. Iroh + LAN discovery covers PC and
-  Android on the same network (and relay when the LAN path dies).
+- BLE is **discovery only** (AirDrop shape): learn `EndpointId` + home relay,
+  then magicsock for offer/blobs. We do not implement AWDL or send files over BLE.
 
 ### LocalSend (target product loop)
 
@@ -68,7 +70,7 @@ Not LocalSend-compatible. Not AirDrop-compatible. Same *shape* as both.
        │ xdg file portal               │  omashare-core  │
        ▼                               │  discovery+iroh  │
   native file manager                  └────────┬─────────┘
-                                                │  LAN / relay
+                                                │  LAN / BLE handshake / relay
                                                 ▼
                                       phone, PC, or another agent
 ```
@@ -156,6 +158,7 @@ Out of scope for v1 TUI: theming engine, mouse-heavy layouts, in-app receive-dir
   silent accept. `--auto-accept` remains for kiosks / tests.
 - `MeteredPolicy::Allow`. Ignore `MeteredConsentNeeded` in the TUI.
 - Relays **on** by default so a walk from Wi-Fi to cellular does not kill the session.
+- BLE advertise + GATT Presence while the agent is running (BlueZ). `--no-ble` skips it.
 - Identity: persist Iroh secret in `$XDG_DATA_HOME/omashare`.
 - Logs: journald via systemd; `--verbose` for the TUI attach session.
 
@@ -164,6 +167,8 @@ Out of scope for v1 TUI: theming engine, mouse-heavy layouts, in-app receive-dir
 Do not change wire constants in v1 unless a bug blocks phone↔phone:
 
 - Discovery port **53318**, multicast `224.0.0.169`
+- BLE service `6f6d6173-6861-7265-0000-000000005318`, presence char `…5319`
+  (JSON `Presence`: `endpoint_id`, alias, kind, pin, `addrs` with relay URLs)
 - Offer ALPN `omashare/offer/0`
 - Payload ALPN `iroh-blobs`
 

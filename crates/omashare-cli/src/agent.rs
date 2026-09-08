@@ -10,18 +10,25 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
-use crate::ipc::{
-    resolve_peer_id, socket_path, AgentLine, ClientCmd, ClientKind, ServerMsg,
-};
+use crate::ipc::{resolve_peer_id, socket_path, AgentLine, ClientCmd, ClientKind, ServerMsg};
 
 pub struct AgentOpts {
     pub config: NodeConfig,
     pub auto_accept: bool,
+    pub enable_ble: bool,
 }
 
 pub async fn run_agent(opts: AgentOpts) -> Result<()> {
     let listener = bind_socket().await?;
     let node = Arc::new(Node::start(opts.config).await.context("start node")?);
+    #[cfg(target_os = "linux")]
+    let _ble = if opts.enable_ble {
+        crate::ble::start(node.clone()).await
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = opts.enable_ble;
     println!(
         "omashare agent  {}  {}  auto-accept={}  socket {}",
         node.alias(),
@@ -45,6 +52,14 @@ pub async fn run_agent(opts: AgentOpts) -> Result<()> {
 pub async fn spawn_embedded_agent(opts: AgentOpts) -> Result<EmbeddedAgent> {
     let listener = bind_socket().await?;
     let node = Arc::new(Node::start(opts.config).await.context("start node")?);
+    #[cfg(target_os = "linux")]
+    let ble = if opts.enable_ble {
+        crate::ble::start(node.clone()).await
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = opts.enable_ble;
     let node_stop = node.clone();
     let handle = tokio::spawn(async move {
         let _ = serve_agent(listener, node, opts.auto_accept).await;
@@ -55,12 +70,19 @@ pub async fn spawn_embedded_agent(opts: AgentOpts) -> Result<EmbeddedAgent> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Ok(EmbeddedAgent { handle, node: node_stop })
+    Ok(EmbeddedAgent {
+        handle,
+        node: node_stop,
+        #[cfg(target_os = "linux")]
+        _ble: ble,
+    })
 }
 
 pub struct EmbeddedAgent {
     handle: tokio::task::JoinHandle<()>,
     node: Arc<Node>,
+    #[cfg(target_os = "linux")]
+    _ble: Option<crate::ble::BleSession>,
 }
 
 impl EmbeddedAgent {
@@ -77,10 +99,7 @@ async fn bind_socket() -> Result<UnixListener> {
     let path = socket_path();
     if path.exists() {
         if crate::ipc::agent_is_healthy().await {
-            anyhow::bail!(
-                "omashare agent already running ({})",
-                path.display()
-            );
+            anyhow::bail!("omashare agent already running ({})", path.display());
         }
         tracing::warn!("removing stale socket {}", path.display());
         let _ = std::fs::remove_file(&path);
@@ -212,7 +231,10 @@ async fn handle_client(
                 continue;
             }
         };
-        if let ClientCmd::Attach { kind: ClientKind::Tui } = cmd {
+        if let ClientCmd::Attach {
+            kind: ClientKind::Tui,
+        } = cmd
+        {
             if is_tui.swap(1, Ordering::Relaxed) == 0 {
                 tui_clients.fetch_add(1, Ordering::Relaxed);
             }
@@ -281,10 +303,7 @@ async fn dispatch(node: &Node, auto_accept: bool, cmd: ClientCmd) -> Result<Serv
     }
 }
 
-async fn write_json<W: AsyncWriteExt + Unpin>(
-    writer: &Mutex<W>,
-    msg: &ServerMsg,
-) -> Result<()> {
+async fn write_json<W: AsyncWriteExt + Unpin>(writer: &Mutex<W>, msg: &ServerMsg) -> Result<()> {
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
     let mut w = writer.lock().await;
@@ -293,10 +312,7 @@ async fn write_json<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-async fn write_event<W: AsyncWriteExt + Unpin>(
-    writer: &Mutex<W>,
-    ev: &NodeEvent,
-) -> Result<()> {
+async fn write_event<W: AsyncWriteExt + Unpin>(writer: &Mutex<W>, ev: &NodeEvent) -> Result<()> {
     let mut line = serde_json::to_string(ev)?;
     line.push('\n');
     let mut w = writer.lock().await;

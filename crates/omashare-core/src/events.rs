@@ -27,6 +27,19 @@ pub struct NearbyPeer {
     pub addrs: Vec<String>,
 }
 
+impl NearbyPeer {
+    pub fn from_presence(p: crate::protocol::Presence, source: DiscoverySource) -> Self {
+        Self {
+            alias: p.alias,
+            device_kind: p.device_kind,
+            endpoint_id: p.endpoint_id,
+            pin_required: p.pin_required,
+            source,
+            addrs: p.addrs,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoverySource {
@@ -35,6 +48,7 @@ pub enum DiscoverySource {
     SubnetScan,
     Manual,
     NativeDnsSd,
+    Bluetooth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

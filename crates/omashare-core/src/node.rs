@@ -206,9 +206,9 @@ impl NodeInner {
     async fn on_outbound_complete(&self, session_id: Uuid) {
         let snap = {
             let sessions = self.sessions.lock().await;
-            sessions.get(&session_id).and_then(|s| {
-                Self::is_outbound_session(s).then_some((s.bytes_total, s.last_path))
-            })
+            sessions
+                .get(&session_id)
+                .and_then(|s| Self::is_outbound_session(s).then_some((s.bytes_total, s.last_path)))
         };
         let Some((bytes_total, path)) = snap else {
             return;
@@ -256,7 +256,8 @@ impl NodeInner {
                 true
             }
             WireMsg::Cancel { .. } => {
-                self.on_outbound_cancel(session_id, "cancelled".into()).await;
+                self.on_outbound_cancel(session_id, "cancelled".into())
+                    .await;
                 true
             }
             _ => false,
@@ -443,7 +444,9 @@ impl NodeInner {
 
     async fn set_session_path(&self, session_id: Uuid, path: TransferPath) -> TransferSession {
         let mut sessions = self.sessions.lock().await;
-        let s = sessions.entry(session_id).or_insert_with(|| Self::new_session(0));
+        let s = sessions
+            .entry(session_id)
+            .or_insert_with(|| Self::new_session(0));
         s.last_path = path;
         s.clone()
     }
@@ -483,14 +486,7 @@ impl OfferHandler {
                 metered_policy: _,
             } => {
                 self.handle_offer(
-                    session_id,
-                    alias,
-                    files,
-                    pin,
-                    remote,
-                    connection,
-                    send,
-                    recv,
+                    session_id, alias, files, pin, remote, connection, send, recv,
                 )
                 .await
             }
@@ -655,11 +651,7 @@ impl OfferHandler {
 
         write_msg(&mut send, &WireMsg::Accept { session_id }).await?;
         self.inner.set_session_peer(session_id, remote).await;
-        self.inner
-            .offer_send
-            .lock()
-            .await
-            .insert(session_id, send);
+        self.inner.offer_send.lock().await.insert(session_id, send);
         self.inner
             .offer_conn
             .lock()
@@ -775,7 +767,10 @@ impl OfferHandler {
             if token.is_cancelled() {
                 bail!("cancelled");
             }
-            match self.download_once(session_id, remote, hash, file.size).await {
+            match self
+                .download_once(session_id, remote, hash, file.size)
+                .await
+            {
                 Ok(()) => {
                     let mut export_backoff = Duration::from_millis(400);
                     let mut export_err = None;
@@ -956,6 +951,9 @@ impl Node {
 
         let secret = persistent_secret(&config.data_dir)?;
         let memory_lookup = MemoryLookup::new();
+        // `address_lookup` *adds* a service. N0 already includes Pkarr publish +
+        // DNS resolve (`dns.iroh.link`), so EndpointId-only dials (BLE handshake)
+        // can still go WAN/relay. MemoryLookup holds LAN/BLE hints from Presence.
         let mut builder = if config.use_relays {
             Endpoint::builder(iroh::endpoint::presets::N0)
         } else {
@@ -968,9 +966,7 @@ impl Node {
         }
         let endpoint = builder.bind().await.context("bind iroh endpoint")?;
 
-        let store = FsStore::load(&blobs_dir)
-            .await
-            .context("open blob store")?;
+        let store = FsStore::load(&blobs_dir).await.context("open blob store")?;
 
         let presence = Presence {
             alias: config.alias.clone(),
@@ -1043,9 +1039,9 @@ impl Node {
                 fp.sort();
                 if fp != last_fp {
                     last_fp = fp;
-                    let _ = inner_mdns
-                        .events
-                        .send(NodeEvent::NearbyUpdated { peers: peers.clone() });
+                    let _ = inner_mdns.events.send(NodeEvent::NearbyUpdated {
+                        peers: peers.clone(),
+                    });
                 }
                 let mut known = inner_mdns.known.lock().await;
                 known.retain(|id, _| peers.iter().any(|p| p.endpoint_id == *id));
@@ -1094,10 +1090,14 @@ impl Node {
         self.inner.discovery.peers().await
     }
 
-    /// Android NsdManager / extra discovery feeds peers here.
+    /// Android NsdManager / BLE / extra discovery feeds peers here.
     pub async fn inject_peer(&self, peer: NearbyPeer) {
         self.inner.discovery.upsert(peer.clone()).await;
         self.inner.remember_peer(&peer).await;
+    }
+
+    pub async fn presence(&self) -> Presence {
+        self.inner.discovery.presence().await
     }
 
     pub async fn set_network_hint(&self, hint: NetworkHint) {
@@ -1384,15 +1384,12 @@ async fn connect_offer(
         inner.memory_lookup.remove_endpoint_info(peer_eid);
         inner.memory_lookup.add_endpoint_info(addr.clone());
         let connect = inner.endpoint.connect(addr.clone(), OFFER_ALPN);
-        match tokio::time::timeout(
-            Duration::from_secs(25),
-            async {
-                tokio::select! {
-                    _ = token.cancelled() => anyhow::bail!("cancelled"),
-                    r = connect => r.map_err(|e| anyhow::anyhow!("{e:#}")),
-                }
-            },
-        )
+        match tokio::time::timeout(Duration::from_secs(25), async {
+            tokio::select! {
+                _ = token.cancelled() => anyhow::bail!("cancelled"),
+                r = connect => r.map_err(|e| anyhow::anyhow!("{e:#}")),
+            }
+        })
         .await
         {
             Ok(Ok(conn)) => return Ok(conn),
@@ -1402,9 +1399,8 @@ async fn connect_offer(
                 warn!("{last:#}");
             }
             Err(_) => {
-                last = anyhow::anyhow!(
-                    "timed out connecting to peer after 25s (attempt {attempt}/4)"
-                );
+                last =
+                    anyhow::anyhow!("timed out connecting to peer after 25s (attempt {attempt}/4)");
                 warn!("{last:#}");
             }
         }
@@ -1438,9 +1434,7 @@ async fn watch_mdns(mdns: MdnsAddressLookup, discovery: Discovery) {
                     .user_data()
                     .map(|u| u.to_string())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| {
-                        format!("device-{}", id.get(..8).unwrap_or(id.as_str()))
-                    });
+                    .unwrap_or_else(|| format!("device-{}", id.get(..8).unwrap_or(id.as_str())));
                 let addrs = endpoint_info
                     .data
                     .addrs()
@@ -1480,13 +1474,7 @@ fn watch_paths(conn: Connection, inner: Arc<NodeInner>, session_id: Uuid) {
                 });
                 if snap.bytes_total > 0 && snap.bytes_done > 0 {
                     inner
-                        .emit_progress(
-                            session_id,
-                            snap.bytes_done,
-                            snap.bytes_total,
-                            path,
-                            true,
-                        )
+                        .emit_progress(session_id, snap.bytes_done, snap.bytes_total, path, true)
                         .await;
                 }
             }
@@ -1519,7 +1507,11 @@ fn unique_dest(dir: &Path, name: &str) -> Result<PathBuf> {
     if !dest.exists() {
         return Ok(dest);
     }
-    let stem = dest.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let stem = dest
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let ext = dest
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))

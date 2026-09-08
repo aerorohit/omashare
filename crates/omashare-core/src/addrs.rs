@@ -13,9 +13,7 @@ pub fn is_cgnat(ip: Ipv4Addr) -> bool {
 
 pub fn is_lan_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v) => {
-            (v.is_private() && !is_cgnat(v)) || v.is_loopback() || v.is_link_local()
-        }
+        IpAddr::V4(v) => (v.is_private() && !is_cgnat(v)) || v.is_loopback() || v.is_link_local(),
         IpAddr::V6(v) => v.is_loopback() || v.is_unique_local(),
     }
 }
@@ -169,6 +167,8 @@ pub fn connection_dial_hints(conn: &Connection) -> Vec<String> {
 }
 
 /// Physical LAN IPv4 plus every relay URL from the local endpoint.
+/// Used in HTTP `/omashare/info` and BLE GATT Presence so a handshake without
+/// LAN addrs can still dial n0 relay / WAN.
 pub fn ip_hint_list(endpoint: &Endpoint) -> Vec<String> {
     let nets = physical_v4_nets();
     let mut port = None;
@@ -234,11 +234,10 @@ mod tests {
         let merged = merge_relay_hints(&peer, &extra);
         let addr = endpoint_addr_from_hints(eid(), &merged);
         assert!(addr_has_relay(&addr), "{:?}", addr.addrs);
-        assert!(
-            addr.addrs
-                .iter()
-                .any(|a| matches!(a, TransportAddr::Ip(sa) if sa.ip().is_ipv4()))
-        );
+        assert!(addr
+            .addrs
+            .iter()
+            .any(|a| matches!(a, TransportAddr::Ip(sa) if sa.ip().is_ipv4())));
     }
 
     #[test]

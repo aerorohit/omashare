@@ -100,10 +100,7 @@ impl IpcClient {
         let (r, w) = tokio::io::split(stream);
         let mut reader = BufReader::new(r);
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .context("read hello")?;
+        reader.read_line(&mut line).await.context("read hello")?;
         if line.is_empty() {
             bail!("agent closed before hello");
         }
@@ -143,7 +140,12 @@ impl IpcClient {
         loop {
             match self.read_line().await? {
                 None => bail!("agent disconnected"),
-                Some(AgentLine::Server(msg @ (ServerMsg::Ok { .. } | ServerMsg::Error { .. } | ServerMsg::Nearby { .. } | ServerMsg::Status { .. }))) => {
+                Some(AgentLine::Server(
+                    msg @ (ServerMsg::Ok { .. }
+                    | ServerMsg::Error { .. }
+                    | ServerMsg::Nearby { .. }
+                    | ServerMsg::Status { .. }),
+                )) => {
                     return Ok(msg);
                 }
                 Some(AgentLine::Server(ServerMsg::Hello { .. })) => continue,
@@ -193,9 +195,10 @@ pub async fn connect_if_running() -> Result<Option<IpcClient>> {
 
 pub fn resolve_peer_id(peers: &[NearbyPeer], to: Option<&str>) -> Result<String> {
     if let Some(want) = to {
-        if let Some(p) = peers.iter().find(|p| {
-            p.alias == want || p.endpoint_id == want || p.endpoint_id.starts_with(want)
-        }) {
+        if let Some(p) = peers
+            .iter()
+            .find(|p| p.alias == want || p.endpoint_id == want || p.endpoint_id.starts_with(want))
+        {
             return Ok(p.endpoint_id.clone());
         }
         bail!("peer not found: {want}");

@@ -31,6 +31,17 @@ struct Inner {
     rebind: Notify,
 }
 
+fn should_update_source(existing: DiscoverySource, new: DiscoverySource) -> bool {
+    match new {
+        DiscoverySource::Mdns => false,
+        DiscoverySource::Bluetooth => matches!(
+            existing,
+            DiscoverySource::Bluetooth | DiscoverySource::Manual
+        ),
+        _ => true,
+    }
+}
+
 impl Discovery {
     pub fn new(presence: Presence, port: u16) -> Self {
         Self {
@@ -69,7 +80,7 @@ impl Discovery {
             existing.alias = peer.alias;
             existing.device_kind = peer.device_kind;
             existing.pin_required = peer.pin_required;
-            if peer.source != DiscoverySource::Mdns {
+            if should_update_source(existing.source, peer.source) {
                 existing.source = peer.source;
             }
             *seen = Instant::now();

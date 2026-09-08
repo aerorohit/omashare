@@ -76,7 +76,9 @@ async fn offer_accept_and_blob_resume_path() {
 
     let mut events = b.subscribe();
     let payload = a_dir.path().join("hello.txt");
-    tokio::fs::write(&payload, b"omashare-walk-away").await.unwrap();
+    tokio::fs::write(&payload, b"omashare-walk-away")
+        .await
+        .unwrap();
 
     let send = tokio::spawn({
         let id = b.endpoint_id();

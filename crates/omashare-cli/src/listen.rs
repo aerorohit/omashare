@@ -16,7 +16,9 @@ pub async fn run(mut client: IpcClient) -> Result<()> {
             _ => String::new(),
         }
     );
-    println!("commands: peers | send FILE [PEER] [PIN] | accept ID | decline ID | cancel [ID] | quit");
+    println!(
+        "commands: peers | send FILE [PEER] [PIN] | accept ID | decline ID | cancel [ID] | quit"
+    );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
@@ -145,7 +147,10 @@ fn print_event(ev: &NodeEvent) {
                 crate::path_label(*path)
             );
         }
-        NodeEvent::TransferComplete { session_id, saved_to } => match saved_to {
+        NodeEvent::TransferComplete {
+            session_id,
+            saved_to,
+        } => match saved_to {
             Some(p) => println!("done {session_id}  saved {p}"),
             None => println!("done {session_id}"),
         },
@@ -155,7 +160,11 @@ fn print_event(ev: &NodeEvent) {
         NodeEvent::NearbyUpdated { peers } if !peers.is_empty() => {
             println!(
                 "nearby: {}",
-                peers.iter().map(|p| p.alias.as_str()).collect::<Vec<_>>().join(", ")
+                peers
+                    .iter()
+                    .map(|p| p.alias.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         NodeEvent::PathChanged { path, .. } => {

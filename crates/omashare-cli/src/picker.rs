@@ -70,8 +70,5 @@ fn typed_paths() -> Result<Vec<PathBuf>> {
     let _ = io::stderr().flush();
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
-    Ok(line
-        .split_whitespace()
-        .map(PathBuf::from)
-        .collect())
+    Ok(line.split_whitespace().map(PathBuf::from).collect())
 }
