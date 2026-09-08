@@ -1,0 +1,15 @@
+[Unit]
+Description=Omashare agent (Iroh LAN + relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Install the binary to ~/.local/bin or change this path.
+# Auto-accept is off: incoming offers need the TUI or a notification + `omashare` accept.
+ExecStart=%h/.local/bin/omashare agent
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

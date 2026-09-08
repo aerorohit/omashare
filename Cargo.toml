@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/omashare-core", "crates/omashare-cli", "crates/omashare-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omashare/omashare"
+
+[workspace.dependencies]
+anyhow = "1"
+iroh = "1.1"
+iroh-blobs = "0.103"
+iroh-mdns-address-lookup = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }

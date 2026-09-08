@@ -1,0 +1,7 @@
+[v1]
+"cargo-ndk 4.1.2 (registry+https://github.com/rust-lang/crates.io-index)" = [
+    "cargo-ndk",
+    "cargo-ndk-env",
+    "cargo-ndk-runner",
+    "cargo-ndk-test",
+]

@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "uniffi.omashare"
+cdylib_name = "omashare_ffi"
+android = true
