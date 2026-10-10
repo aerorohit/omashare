@@ -1,10 +1,12 @@
 # Omashare
 
-Send files between Linux and Android on the local network, with a relay fallback when Wi-Fi drops. One command, `omashare`, is the TUI and the node. Not LocalSend-compatible. No VPN.
+Omashare shares files between two devices running Omashare. Linux to Linux, Linux to Android, and Android to Android use the same protocol. Devices find each other nearby on the local network, and over Bluetooth on Linux. You pick files and a device. The other person accepts or declines, and accepted files are saved on the receiver. On Linux, received files go to `~/Downloads/omashare`.
 
-## Installation
+A device you mark trusted will auto-accept future files from you. Everyone else needs an explicit accept. If Wi-Fi drops mid-transfer, the transfer can continue over another path, including a relay. `--offline` keeps it on the local network only.
 
-Requires Rust (stable) and Linux.
+## Install
+
+Needs Rust stable and Linux.
 
 ```bash
 git clone https://github.com/aerorohit/omashare && cd omashare
@@ -12,16 +14,21 @@ cargo build --release -p omashare
 install -Dm755 target/release/omashare ~/.local/bin/omashare
 ```
 
-`~/.local/bin` must be on `PATH`.
+`~/.local/bin` must be on `PATH`. Then run `omashare`.
 
-`omashare` in a terminal starts the TUI. With no terminal the same binary stays up as the node. If a node is already running, the TUI attaches to it.
+## Daily use
 
-## Commands
+`omashare` is one binary. In a terminal it is a small TUI: a nearby list.
+
+`j` and `k`, or the arrow keys, move the selection. `s` opens the system file picker (xdg-desktop-portal, then zenity). Enter sends to the selected device. `t` trusts or untrusts that device. `a` and `d` accept or decline an incoming offer. `c` cancels. `q` quits.
+
+Started by systemd, or by the optional bar plugin, the same binary stays running so the machine can still receive. If you open the TUI while that background process is already up, the TUI attaches to it.
+
+Logs while the TUI is open go to `$XDG_DATA_HOME/omashare/omashare.log`.
 
 ```bash
-omashare send photo.jpg --to other-laptop
-omashare cancel
-omashare cancel SESSION_ID
+omashare send FILE --to NAME
+omashare cancel [SESSION_ID]
 omashare accept SESSION_ID
 omashare decline SESSION_ID
 omashare trust list
@@ -29,47 +36,34 @@ omashare trust add ENDPOINT_OR_ALIAS
 omashare trust remove ENDPOINT_OR_ALIAS
 ```
 
-`send` uses the running node, or a one-shot node if it is down. `cancel` with no id cancels every open session. `trust add` takes an endpoint id, or exactly one nearby alias.
+`send` sends `FILE` to the device named `NAME`. `cancel` stops one session, or every open session when you leave the id off. `accept` and `decline` answer an incoming offer. `trust list` shows trusted devices. `trust add` and `trust remove` take an endpoint id, or a nearby alias when exactly one device uses that name.
 
-Incoming files go to `~/Downloads/omashare`.
+`--offline` stays on the local network. `--pin 1234` requires senders to pass that PIN. `--no-ble` skips Bluetooth discovery. `--auto-accept` is for unattended machines: it accepts everyone and leaves the trust list unchanged.
 
-`--offline` skips relays and stays on the LAN. `--pin 1234` requires senders to pass that PIN. `--no-ble` skips Bluetooth discovery. `--auto-accept` is for kiosks only and does not write the trust file.
+Trusted devices are stored in `$XDG_DATA_HOME/omashare/trusted.json`.
 
-Trusted devices auto-accept and live in `$XDG_DATA_HOME/omashare/trusted.json`.
+## How a transfer works
 
-## TUI
+Devices discover each other nearby. You offer files to one of them. They accept, or a trusted device accepts on its own. The files land in Downloads. If the network changes mid-transfer, the transfer can continue on another path.
 
-```
-[s] send   [enter] send to selected   [t] trust   [a] accept   [d] decline   [c] cancel   [q] quit
-```
+## Optional
 
-`j` / `k` (or the arrow keys) move the selection. `s` opens the native file manager (xdg-desktop-portal, then zenity). `enter` sends the picked files to the selected device. `t` trusts or untrusts that device. `a` and `d` accept or decline an incoming offer. `c` cancels the transfer. `q` quits.
-
-TUI logs go to `$XDG_DATA_HOME/omashare/omashare.log`, not the screen.
-
-## systemd
-
-Optional. Copy [`contrib/omashare.service`](contrib/omashare.service) to `~/.config/systemd/user/`. The unit starts `~/.local/bin/omashare`.
+**systemd user service.** Copy [`contrib/omashare.service`](contrib/omashare.service) to `~/.config/systemd/user/` and run:
 
 ```bash
 systemctl --user enable --now omashare
 ```
 
-The unit has no terminal, so it is the node only. Accept offers from the TUI, the plugin, or `omashare accept`.
+The unit expects the binary at `~/.local/bin/omashare`.
 
-## Omarchy plugin
-
-Optional. Omashare does not require Omarchy.
-
-If you use Omarchy and `omashare` is already on `PATH`, copy [`contrib/omarchy-plugin`](contrib/omarchy-plugin) to `~/.config/omarchy/plugins/aerorohit.omashare` and enable Omashare on the bar. The plugin only talks to the installed `omashare` binary.
+**Omarchy.** If you use Omarchy, copy [`contrib/omarchy-plugin`](contrib/omarchy-plugin) to `~/.config/omarchy/plugins/aerorohit.omashare` and enable Omashare on the bar. The plugin uses the `omashare` binary already on `PATH`. You can share files without Omarchy and without the plugin.
 
 ## Android
 
-The Android app is a separate repo: [github.com/aerorohit/omashare-android](https://github.com/aerorohit/omashare-android). It uses the same protocol. Build instructions live in that repo.
+The Android app is a separate repository: <https://github.com/aerorohit/omashare-android>
+
+Install that app on a phone to send and receive with a Linux machine or with another phone. Build steps live in that repo.
 
 ## Protocol
 
-- Discovery UDP/TCP port **53318**, multicast `224.0.0.169`, HTTP `GET /omashare/info`
-- BLE discovery: service UUID `6f6d6173-6861-7265-0000-000000005318`, GATT Presence JSON on `…5319`. Handshake only; files still go LAN / WAN / n0 relay.
-- Offer ALPN `omashare/offer/0`
-- Payload ALPN `iroh-blobs`
+Discovery uses port 53318 and multicast `224.0.0.169`. Bluetooth carries the handshake. The file payload goes over [Iroh](https://github.com/n0-computer/iroh).

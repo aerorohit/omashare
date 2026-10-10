@@ -9,7 +9,7 @@ use omashare_core::events::{DiscoverySource, NearbyPeer};
 use omashare_core::protocol::{DeviceKind, FileOffer};
 use omashare_core::{NodeEvent, TransferPath};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
@@ -379,67 +379,85 @@ fn draw(frame: &mut Frame, ui: &Ui) {
         .split(frame.area());
 
     let header = Line::from(vec![
-        Span::styled("omashare", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  ·  "),
-        Span::raw(&ui.alias),
-        Span::raw("  ·  "),
-        Span::raw(short_id(&ui.endpoint_id)),
-        Span::raw("  ·  listening"),
+        Span::styled("omashare", paint(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  ", dim()),
+        Span::styled(&ui.alias, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  ", dim()),
+        Span::styled(short_id(&ui.endpoint_id), dim()),
+        Span::styled("  ·  ", dim()),
+        Span::styled("listening", paint(Color::Green)),
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
     let items: Vec<ListItem> = if ui.peers.is_empty() {
-        vec![ListItem::new("  (searching…)")]
+        vec![ListItem::new(Span::styled("  (searching…)", dim()))]
     } else {
         ui.peers
             .iter()
             .enumerate()
-            .map(|(i, p)| {
-                let mark = if i == ui.selected { "●" } else { " " };
-                let trust = if ui.trusted.contains(&p.endpoint_id) {
-                    "trusted"
-                } else {
-                    ""
-                };
-                let kind = kind_label(p.device_kind);
-                let src = source_label(p.source);
-                ListItem::new(format!("{mark} {:<18} {trust:<8} {kind:<8} {src}", p.alias))
-            })
+            .map(|(i, p)| ListItem::new(peer_line(ui, i, p)))
             .collect()
     };
     frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title("Nearby")),
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(paint(Color::Blue))
+                .title(Span::styled(
+                    " Nearby ",
+                    paint(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+        ),
         chunks[1],
     );
 
-    let progress = if let Some(p) = &ui.progress {
+    let (progress, progress_border) = if let Some(p) = &ui.progress {
         let total = p.bytes_total.max(1);
         let pct = (p.bytes_done.saturating_mul(100) / total).min(100);
-        format!(
-            "transfer  {}  {} / {}  {pct}%  {}",
-            p.name,
-            crate::human_bytes(p.bytes_done),
-            crate::human_bytes(p.bytes_total),
-            crate::path_label(p.path)
-        )
+        let line = Line::from(vec![
+            Span::styled("transfer  ", dim()),
+            Span::styled(p.name.as_str(), paint(Color::Cyan)),
+            Span::raw("  "),
+            Span::raw(crate::human_bytes(p.bytes_done)),
+            Span::styled(" / ", dim()),
+            Span::raw(crate::human_bytes(p.bytes_total)),
+            Span::raw("  "),
+            Span::styled(format!("{pct}%"), paint(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(
+                crate::path_label(p.path).to_string(),
+                paint(Color::Yellow),
+            ),
+        ]);
+        (line, Color::Green)
     } else if !ui.status.is_empty() {
-        ui.status.clone()
+        let color = if ui.status.starts_with("fail") {
+            Color::Red
+        } else {
+            Color::Reset
+        };
+        (Line::from(Span::styled(ui.status.as_str(), paint(color))), Color::Blue)
     } else if !ui.picked.is_empty() {
-        format!("{} file(s) ready — enter to send", ui.picked.len())
+        (
+            Line::from(Span::styled(
+                format!("{} file(s) ready — enter to send", ui.picked.len()),
+                paint(Color::Yellow),
+            )),
+            Color::Yellow,
+        )
     } else {
-        String::new()
+        (Line::from(""), Color::Blue)
     };
     frame.render_widget(
-        Paragraph::new(progress).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(progress).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(paint(progress_border)),
+        ),
         chunks[2],
     );
 
-    frame.render_widget(
-        Paragraph::new(
-            "[s] send   [enter] send to selected   [t] trust   [a] accept   [d] decline   [c] cancel   [q] quit",
-        ),
-        chunks[3],
-    );
+    frame.render_widget(Paragraph::new(key_hint()), chunks[3]);
 
     if let Some(offer) = &ui.offer {
         draw_modal(frame, offer);
@@ -450,19 +468,123 @@ fn draw_modal(frame: &mut Frame, offer: &Offer) {
     let area = centered(frame.area(), 60, 8);
     let names: Vec<_> = offer.files.iter().map(|f| f.name.as_str()).collect();
     let sizes: u64 = offer.files.iter().map(|f| f.size).sum();
-    let text = format!(
-        "{} wants to send\n{}\n{}\n\n[a] accept   [d] decline",
-        offer.from_alias,
-        names.join(", "),
-        crate::human_bytes(sizes)
-    );
+    let text = vec![
+        Line::from(vec![
+            Span::styled(offer.from_alias.as_str(), paint(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" wants to send"),
+        ]),
+        Line::from(names.join(", ")),
+        Line::from(Span::styled(crate::human_bytes(sizes), dim())),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[a]", paint(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" accept   "),
+            Span::styled("[d]", paint(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw(" decline"),
+        ]),
+    ];
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("Incoming")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(paint(Color::Yellow))
+                    .title(Span::styled(
+                        " Incoming ",
+                        paint(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+            ),
         area,
     );
+}
+
+/// ANSI palette colors (0–15). Terminal themes remap these, so the TUI follows the theme.
+fn paint(color: Color) -> Style {
+    Style::default().fg(color)
+}
+
+fn dim() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
+fn peer_line(ui: &Ui, index: usize, peer: &NearbyPeer) -> Line<'static> {
+    let selected = index == ui.selected;
+    let mark = if selected { "●" } else { " " };
+    let mark_style = if selected {
+        paint(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        dim()
+    };
+    let name_style = if selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![
+        Span::styled(format!("{mark} "), mark_style),
+        Span::styled(format!("{:<18}", peer.alias), name_style),
+    ];
+    if ui.trusted.contains(&peer.endpoint_id) {
+        spans.push(Span::styled(
+            format!("{:<8}", "trusted"),
+            paint(Color::Green),
+        ));
+    } else {
+        spans.push(Span::raw(format!("{:<8}", "")));
+    }
+    spans.push(Span::styled(
+        format!("{:<8}", kind_label(peer.device_kind)),
+        paint(kind_color(peer.device_kind)),
+    ));
+    spans.push(Span::styled(
+        source_label(peer.source).to_string(),
+        paint(source_color(peer.source)),
+    ));
+    Line::from(spans)
+}
+
+fn key_hint() -> Line<'static> {
+    let keys = [
+        ("s", "send"),
+        ("enter", "send to selected"),
+        ("t", "trust"),
+        ("a", "accept"),
+        ("d", "decline"),
+        ("c", "cancel"),
+        ("q", "quit"),
+    ];
+    let mut spans = Vec::new();
+    for (i, (key, label)) in keys.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            paint(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(format!(" {label}")));
+    }
+    Line::from(spans)
+}
+
+fn kind_color(kind: DeviceKind) -> Color {
+    match kind {
+        DeviceKind::Mobile => Color::Magenta,
+        DeviceKind::Desktop => Color::Blue,
+        DeviceKind::Headless => Color::Yellow,
+        DeviceKind::Unknown => Color::Reset,
+    }
+}
+
+fn source_color(source: DiscoverySource) -> Color {
+    match source {
+        DiscoverySource::Bluetooth => Color::Magenta,
+        DiscoverySource::Mdns | DiscoverySource::NativeDnsSd => Color::Cyan,
+        DiscoverySource::Multicast | DiscoverySource::SubnetScan => Color::Blue,
+        DiscoverySource::Manual => Color::Reset,
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
