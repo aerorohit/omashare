@@ -88,16 +88,8 @@ enum TrustCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let filter = if cli.verbose {
-        "omashare=debug"
-    } else {
-        "omashare=info"
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive(filter.parse()?),
-        )
-        .init();
+    let tui = cli.command.is_none() && std::io::stdout().is_terminal();
+    let log_path = init_tracing(cli.verbose, tui)?;
 
     let config = node_config(&cli);
     match cli.command {
@@ -115,8 +107,11 @@ async fn main() -> Result<()> {
         Some(Commands::Trust { cmd }) => run_trust(cmd).await?,
         Some(Commands::Send { files, to, pin }) => run_send(config, files, to, pin).await?,
         None => {
-            if std::io::stdout().is_terminal() {
+            if tui {
                 run_tui(config, cli.auto_accept, !cli.no_ble).await?;
+                if let Some(path) = log_path {
+                    eprintln!("logs {}", path.display());
+                }
             } else {
                 agent::run_agent(agent::AgentOpts {
                     config,
@@ -128,6 +123,33 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// TUI sessions log to `$XDG_DATA_HOME/omashare/omashare.log` so tracing
+/// does not paint over the alternate screen. Headless runs stay on stderr.
+fn init_tracing(verbose: bool, to_file: bool) -> Result<Option<PathBuf>> {
+    let directive = if verbose { "omashare=debug" } else { "omashare=info" };
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(directive.parse().context("log filter")?);
+    if !to_file {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return Ok(None);
+    }
+    let path = trust::data_dir().join("omashare.log");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open log {}", path.display()))?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(file))
+        .init();
+    Ok(Some(path))
 }
 
 fn node_config(cli: &Cli) -> NodeConfig {
