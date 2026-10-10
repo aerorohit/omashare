@@ -66,9 +66,17 @@ fn typed_paths() -> Result<Vec<PathBuf>> {
     if !io::stdin().is_terminal() {
         return Ok(Vec::new());
     }
-    eprint!("file paths (space-separated, empty to cancel): ");
+    eprint!("file paths (one per line, empty line to finish): ");
     let _ = io::stderr().flush();
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(line.split_whitespace().map(PathBuf::from).collect())
+    let mut out = Vec::new();
+    loop {
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let path = line.trim();
+        if path.is_empty() {
+            break;
+        }
+        out.push(PathBuf::from(path));
+    }
+    Ok(out)
 }

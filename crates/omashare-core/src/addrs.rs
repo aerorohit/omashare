@@ -73,12 +73,19 @@ pub fn is_relay_hint(h: &str) -> bool {
     h.starts_with("http://") || h.starts_with("https://")
 }
 
-/// LAN sockets first, then other private IPv4, then every relay URL.
+fn keep_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    !(ip.is_loopback() || ip.is_multicast() || ip.is_unicast_link_local())
+}
+
+/// LAN IPv4 first, then other private IPv4, then IPv6 / public IPv4, then relays.
 /// Relays are never dropped so magicsock can walk away from Wi-Fi.
+/// Global IPv6 must be kept: many phones have no RFC1918 address on the path
+/// magicsock actually selected, and dropping it forces a relay-only blobs dial.
 pub fn prefer_lan_hints(hints: &[String]) -> Vec<String> {
     let mut lan = Vec::new();
     let mut relays = Vec::new();
     let mut other_priv = Vec::new();
+    let mut wan = Vec::new();
     for h in hints {
         if is_relay_hint(h) {
             if !relays.contains(h) {
@@ -92,10 +99,14 @@ pub fn prefer_lan_hints(hints: &[String]) -> Vec<String> {
         match sa.ip() {
             IpAddr::V4(v) if on_physical_lan(v) => lan.push(h.clone()),
             IpAddr::V4(v) if v.is_private() && !is_cgnat(v) => other_priv.push(h.clone()),
-            _ => {}
+            IpAddr::V4(v) if v.is_loopback() || is_cgnat(v) || v.is_link_local() => {}
+            IpAddr::V4(_) => wan.push(h.clone()),
+            IpAddr::V6(v) if keep_ipv6(v) => wan.push(h.clone()),
+            IpAddr::V6(_) => {}
         }
     }
     let mut out = if lan.is_empty() { other_priv } else { lan };
+    out.extend(wan);
     out.extend(relays);
     out
 }
@@ -173,9 +184,17 @@ pub fn ip_hint_list(endpoint: &Endpoint) -> Vec<String> {
     let nets = physical_v4_nets();
     let mut port = None;
     let mut relays = Vec::new();
+    let mut v6 = Vec::new();
     for a in &endpoint.addr().addrs {
         match a {
-            TransportAddr::Ip(sa) if sa.port() != 0 => port = Some(sa.port()),
+            TransportAddr::Ip(sa) if sa.port() != 0 => {
+                port = Some(sa.port());
+                if let IpAddr::V6(ip) = sa.ip() {
+                    if keep_ipv6(ip) {
+                        v6.push(sa.to_string());
+                    }
+                }
+            }
             TransportAddr::Relay(url) => {
                 let s = url.to_string();
                 if !relays.contains(&s) {
@@ -191,6 +210,7 @@ pub fn ip_hint_list(endpoint: &Endpoint) -> Vec<String> {
             out.push(SocketAddr::from((ip, port)).to_string());
         }
     }
+    out.extend(v6);
     out.extend(relays);
     out
 }
@@ -225,6 +245,20 @@ mod tests {
             !out.iter().any(|h| h.starts_with("100.68.")),
             "CGNAT should be dropped: {out:?}"
         );
+    }
+
+    #[test]
+    fn prefer_lan_keeps_global_ipv6() {
+        let hints = vec![
+            "[2402:e280:2167:a74:9cfc:d8ff:fe5f:8834]:44028".into(),
+            "https://aps1-1.relay.n0.iroh.link./".into(),
+        ];
+        let out = prefer_lan_hints(&hints);
+        assert!(
+            out.iter().any(|h| h.contains("2402:e280")),
+            "global IPv6 must be dialable: {out:?}"
+        );
+        assert!(out.iter().any(|h| h.starts_with("https://")), "{out:?}");
     }
 
     #[test]

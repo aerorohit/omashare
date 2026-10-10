@@ -251,6 +251,17 @@ async fn handle_key(
                 ui.status = "no incoming offer".into();
             }
         }
+        KeyCode::Char('c') => {
+            let id = ui
+                .progress
+                .as_ref()
+                .map(|p| p.session_id.clone())
+                .or_else(|| ui.inbox.first().map(|o| o.session_id.clone()));
+            client
+                .send_cmd(&ClientCmd::Cancel { session_id: id })
+                .await?;
+            ui.status = "cancelling…".into();
+        }
         _ => {}
     }
     Ok(())
@@ -368,7 +379,7 @@ fn draw(frame: &mut Frame, ui: &Ui) {
     );
 
     frame.render_widget(
-        Paragraph::new("[s] send   [enter] send to selected   [a] accept   [d] decline   [q] quit"),
+        Paragraph::new("[s] send   [enter] send to selected   [a] accept   [d] decline   [c] cancel   [q] quit"),
         chunks[3],
     );
 

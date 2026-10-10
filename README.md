@@ -22,11 +22,14 @@ cargo build -p omashare --release
 # or: ./target/release/omashare tui
 # Send via the agent (or a one-shot node if the agent is down)
 ./target/release/omashare send photo.jpg --to other-laptop
+# Cancel the current transfer (omit the id to cancel every open session)
+./target/release/omashare cancel
+./target/release/omashare cancel SESSION_ID
 ```
 
 Incoming files go to `~/Downloads/omashare`. `--offline` skips n0 relays (LAN only). `--pin 1234` requires senders to pass that PIN. `--auto-accept` is for kiosks and tests only. `--no-ble` skips Bluetooth discovery (BlueZ).
 
-The TUI opens the native file manager (xdg-desktop-portal, then zenity) for **s** / search. It does not browse files itself.
+The TUI opens the native file manager (xdg-desktop-portal, then zenity) for **s** / search. It does not browse files itself. **c** cancels the in-progress transfer.
 
 User systemd unit: copy [`contrib/omashare.service`](contrib/omashare.service) to `~/.config/systemd/user/`, put the binary on `~/.local/bin/omashare`, then `systemctl --user enable --now omashare`. The unit runs `omashare agent` (consent required).
 

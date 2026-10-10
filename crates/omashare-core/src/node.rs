@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{Connection, PathEvent, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -14,7 +14,7 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::Hash;
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use n0_future::StreamExt;
-use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -517,17 +517,20 @@ impl OfferHandler {
                 Ok(())
             }
             WireMsg::Cancel { session_id } => {
-                if self
-                    .inner
-                    .sessions
-                    .lock()
-                    .await
-                    .get(&session_id)
-                    .is_some_and(NodeInner::is_outbound_session)
-                {
+                let (outbound, token) = {
+                    let sessions = self.inner.sessions.lock().await;
+                    let outbound = sessions
+                        .get(&session_id)
+                        .is_some_and(NodeInner::is_outbound_session);
+                    let token = sessions.get(&session_id).map(|s| s.token.clone());
+                    (outbound, token)
+                };
+                if outbound {
                     self.inner
                         .on_outbound_cancel(session_id, "cancelled".into())
                         .await;
+                } else if let Some(token) = token {
+                    token.cancel();
                 }
                 Ok(())
             }
@@ -626,11 +629,11 @@ impl OfferHandler {
             pin_required: self.inner.config.pin.is_some(),
         });
 
-        let accepted = tokio::time::timeout(Duration::from_secs(120), rx)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(false);
+        let accepted = tokio::select! {
+            r = rx => r.unwrap_or(false),
+            () = tokio::time::sleep(Duration::from_secs(120)) => false,
+            _ = read_msg(&mut recv) => false,
+        };
 
         let _ = self.inner.events.send(NodeEvent::OfferResolved {
             session_id: session_id.to_string(),
@@ -651,6 +654,7 @@ impl OfferHandler {
 
         write_msg(&mut send, &WireMsg::Accept { session_id }).await?;
         self.inner.set_session_peer(session_id, remote).await;
+        self.inner.register_send_blobs(session_id, &files).await;
         self.inner.offer_send.lock().await.insert(session_id, send);
         self.inner
             .offer_conn
@@ -659,15 +663,31 @@ impl OfferHandler {
             .insert(session_id, connection.clone());
         let token = self.inner.session_token(session_id).await;
         let cancel_watch = token.clone();
+        let offer_conn = connection.clone();
         tokio::spawn(async move {
             loop {
                 match read_msg(&mut recv).await {
                     Ok(WireMsg::Cancel { .. }) => {
+                        info!(%session_id, "sender cancelled offer");
                         cancel_watch.cancel();
                         break;
                     }
                     Ok(_) => {}
-                    Err(_) => break,
+                    Err(e) => {
+                        let closed = format!("{:?}", offer_conn.close_reason()).to_ascii_lowercase();
+                        if closed.contains("cancelled")
+                            || format!("{e:#}").to_ascii_lowercase().contains("cancelled")
+                        {
+                            info!(%session_id, "offer connection closed as cancelled");
+                            cancel_watch.cancel();
+                        } else {
+                            warn!(
+                                %session_id,
+                                "offer control stream ended ({e:#}); still pulling blobs"
+                            );
+                        }
+                        break;
+                    }
                 }
             }
         });
@@ -850,88 +870,86 @@ impl OfferHandler {
         total: u64,
     ) -> Result<()> {
         let token = self.inner.session_token(session_id).await;
-        let already = match self.inner.store.blobs().status(hash).await {
-            Ok(BlobStatus::Complete { size }) if total == 0 || size == total => return Ok(()),
-            Ok(BlobStatus::Complete { size }) => size,
-            Ok(BlobStatus::Partial { size }) => size.unwrap_or(0),
-            _ => 0,
-        };
-        if already > 0 {
-            self.inner
-                .emit_progress(session_id, already, total, TransferPath::Unknown, true)
-                .await;
-            self.inner
-                .tell_sender_progress(session_id, already, total)
-                .await;
+        if self.blob_fully_present(hash, total).await {
+            return Ok(());
         }
         let addr = self.inner.blobs_addr(session_id, remote).await;
         info!(
             %session_id,
             peer = %remote,
             addrs = ?addr.addrs,
-            have = already,
             "connecting blobs ALPN"
         );
-        let conn = tokio::time::timeout(
-            Duration::from_secs(20),
-            self.inner.endpoint.connect(addr, iroh_blobs::ALPN),
-        )
-        .await
-        .context("blobs connect timeout")?
-        .map_err(|e| anyhow::anyhow!("blobs connect: {e:#}"))?;
+        let conn = tokio::select! {
+            _ = token.cancelled() => bail!("cancelled"),
+            r = tokio::time::timeout(
+                Duration::from_secs(20),
+                self.inner.endpoint.connect(addr, iroh_blobs::ALPN),
+            ) => r
+                .context("blobs connect timeout")?
+                .map_err(|e| anyhow!("blobs connect: {e:#}"))?,
+        };
         self.inner.remember_live_paths(&conn).await;
-        let store = self.inner.store.clone();
-        let (prog_tx, mut prog_rx) = watch::channel(already);
-        let (done_tx, done_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let progress = store.remote().fetch(conn, hash);
+        let abort = conn.clone();
+        // `fetch()` skips ranges we already have. After cancel that leftover is
+        // often one 32KiB chunk; the next GET then reports 32KB and never asks
+        // for the rest. Re-download the whole blob instead.
+        let result = {
+            let progress = self
+                .inner
+                .store
+                .remote()
+                .execute_get(conn, iroh_blobs::protocol::GetRequest::blob(hash));
             let stream = progress.stream();
             futures_util::pin_mut!(stream);
-            let outcome = loop {
-                match stream.next().await {
-                    Some(GetProgressItem::Progress(n)) => {
-                        let _ = prog_tx.send(already.saturating_add(n));
+            let mut last_prog = Instant::now();
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        break Err(anyhow!("cancelled"));
                     }
-                    Some(GetProgressItem::Done(_)) => break Ok(()),
-                    Some(GetProgressItem::Error(e)) => {
-                        break Err(anyhow::anyhow!("blobs get: {e:#}"));
+                    _ = tokio::time::sleep(DOWNLOAD_IDLE.saturating_sub(last_prog.elapsed()).max(Duration::from_millis(200))) => {
+                        if last_prog.elapsed() < DOWNLOAD_IDLE {
+                            continue;
+                        }
+                        if self.blob_fully_present(hash, total).await {
+                            break Ok(());
+                        }
+                        break Err(anyhow!("blobs ALPN stalled (no progress for {DOWNLOAD_IDLE:?})"));
                     }
-                    None => break Err(anyhow::anyhow!("blobs ALPN stream ended incomplete")),
-                }
-            };
-            let _ = done_tx.send(outcome);
-        });
-        let mut last_prog = Instant::now();
-        let mut done_rx = done_rx;
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => bail!("cancelled"),
-                _ = tokio::time::sleep(DOWNLOAD_IDLE.saturating_sub(last_prog.elapsed()).max(Duration::from_millis(200))) => {
-                    if last_prog.elapsed() < DOWNLOAD_IDLE {
-                        continue;
+                    item = stream.next() => {
+                        match item {
+                            Some(GetProgressItem::Progress(n)) => {
+                                last_prog = Instant::now();
+                                self.inner
+                                    .emit_progress(session_id, n.min(total.max(n)), total, TransferPath::Unknown, false)
+                                    .await;
+                                self.inner.tell_sender_progress(session_id, n, total).await;
+                            }
+                            Some(GetProgressItem::Done(_)) => {
+                                if self.blob_fully_present(hash, total).await {
+                                    break Ok(());
+                                }
+                                break Err(anyhow!("blobs ALPN finished but blob missing"));
+                            }
+                            Some(GetProgressItem::Error(e)) => {
+                                break Err(anyhow!("blobs get: {e:#}"));
+                            }
+                            None => break Err(anyhow!("blobs ALPN stream ended incomplete")),
+                        }
                     }
-                    if self.blob_fully_present(hash, total).await {
-                        return Ok(());
-                    }
-                    bail!("blobs ALPN stalled (no progress for {DOWNLOAD_IDLE:?})");
-                }
-                outcome = &mut done_rx => {
-                    outcome.context("blob get task")??;
-                    if self.blob_fully_present(hash, total).await {
-                        return Ok(());
-                    }
-                    anyhow::bail!("blobs ALPN finished but blob missing");
-                }
-                Ok(()) = prog_rx.changed() => {
-                    last_prog = Instant::now();
-                    let n = *prog_rx.borrow_and_update();
-                    self.inner
-                        .emit_progress(session_id, n.min(total.max(n)), total, TransferPath::Unknown, false)
-                        .await;
-                    self.inner.tell_sender_progress(session_id, n, total).await;
                 }
             }
+        };
+        let reason: &[u8] = if result.as_ref().is_err_and(is_cancel_err) {
+            b"cancelled"
+        } else {
+            b"aborted"
+        };
+        if result.is_err() {
+            abort.close(0u32.into(), reason);
         }
+        result
     }
 
     async fn blob_fully_present(&self, hash: Hash, expected: u64) -> bool {
@@ -1035,7 +1053,10 @@ impl Node {
                 disc.set_direct_addrs(ip_hint_list(&inner_mdns.endpoint))
                     .await;
                 let peers = disc.peers().await;
-                let mut fp: Vec<String> = peers.iter().map(|p| p.endpoint_id.clone()).collect();
+                let mut fp: Vec<String> = peers
+                    .iter()
+                    .map(|p| format!("{}:{:?}:{}", p.endpoint_id, p.source, p.addrs.len()))
+                    .collect();
                 fp.sort();
                 if fp != last_fp {
                     last_fp = fp;
@@ -1102,6 +1123,9 @@ impl Node {
 
     pub async fn set_network_hint(&self, hint: NetworkHint) {
         *self.inner.network_hint.write().await = hint;
+        if !matches!(hint, NetworkHint::Wifi) {
+            self.inner.discovery.drop_lan_paths().await;
+        }
     }
 
     /// Rebind LAN multicast and scan now (call after Wi-Fi returns).
@@ -1188,13 +1212,40 @@ impl Node {
         if let Some(tx) = self.inner.pending_offers.lock().await.remove(&session_id) {
             let _ = tx.send(false);
         }
-        let token = self.inner.session_token(session_id).await;
-        token.cancel();
+        // Tell the peer before cancelling locally. Cancelling the token first lets
+        // `run_outbound_send` drop the offer stream via `finish_session_streams`,
+        // so Cancel never goes out and the receiver keeps pulling blobs.
         if let Some(mut send) = self.inner.offer_send.lock().await.remove(&session_id) {
             let _ = write_msg(&mut send, &WireMsg::Cancel { session_id }).await;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_millis(400), send.stopped()).await;
         }
         if let Some(conn) = self.inner.offer_conn.lock().await.remove(&session_id) {
             conn.close(0u32.into(), b"cancelled");
+        }
+        let hashes: Vec<Hash> = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|s| s.blobs.iter().map(|(h, _)| *h).collect())
+            .unwrap_or_default();
+        let token = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|s| s.token.clone());
+        if let Some(token) = token {
+            token.cancel();
+        }
+        // Wait until the in-flight GET drops its per-hash lock so the next
+        // share of the same file does not resume a half-written chunk.
+        for h in hashes {
+            let lock = self.inner.blob_pull_lock(h).await;
+            let _ = lock.lock().await;
         }
         self.inner.finish_session_streams(session_id).await;
         let _ = self.inner.events.send(NodeEvent::TransferFailed {
@@ -1241,122 +1292,30 @@ impl Node {
         self.inner.set_peer_lookup(peer_eid, &hints).await;
         let session_id = Uuid::new_v4();
         self.inner.touch_session(session_id, 0).await;
-        let token = self.inner.session_token(session_id).await;
-        let mut files = Vec::new();
-        for path in paths {
-            if token.is_cancelled() {
-                anyhow::bail!("cancelled");
-            }
-            let tag = import_path(&self.inner.store, path).await?;
-            let meta = tokio::fs::metadata(path).await.with_context(|| {
-                format!("stat {} after import (file vanished?)", path.display())
-            })?;
-            files.push(FileOffer {
-                name: path
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("file"))
-                    .to_string_lossy()
-                    .into(),
-                size: meta.len(),
-                hash: tag.to_string(),
-            });
-        }
-        if token.is_cancelled() {
-            anyhow::bail!("cancelled");
-        }
-        let bytes_total: u64 = files.iter().map(|f| f.size).sum();
-        self.inner.touch_session(session_id, bytes_total).await;
-        self.inner.register_send_blobs(session_id, &files).await;
-        self.inner.set_session_peer(session_id, peer_eid).await;
-        info!(
-            peer = %peer_id,
-            addrs = ?addr.addrs,
-            "connecting to send offer {session_id}"
-        );
-        let conn = connect_offer(&self.inner, peer_eid, peer_id, addr, &token).await?;
-        if token.is_cancelled() {
-            conn.close(0u32.into(), b"cancelled");
-            anyhow::bail!("cancelled");
-        }
-        let (mut send, mut recv) = conn.open_bi().await.context("open stream")?;
-        write_msg(
-            &mut send,
-            &WireMsg::Offer {
-                session_id,
-                alias: self.inner.config.alias.clone(),
-                files: files.clone(),
-                pin,
-                metered_policy: self.inner.config.metered_policy,
-            },
-        )
-        .await?;
-        self.inner.offer_send.lock().await.insert(session_id, send);
-        self.inner
-            .offer_conn
-            .lock()
-            .await
-            .insert(session_id, conn.clone());
-        self.inner
-            .emit_progress(session_id, 0, bytes_total, TransferPath::Unknown, true)
-            .await;
-        let events = self.inner.events.clone();
         let inner = self.inner.clone();
+        let peer_id = peer_id.to_string();
+        let paths = paths.to_vec();
         tokio::spawn(async move {
-            let outcome = read_msg(&mut recv).await;
-            match outcome {
-                Ok(WireMsg::Accept { .. }) => {
-                    info!("offer {session_id} accepted; serving blobs");
-                    watch_paths(conn.clone(), inner.clone(), session_id);
-                    inner.remember_live_paths(&conn).await;
-                    let _ = events.send(NodeEvent::OfferAccepted {
+            if let Err(e) = run_outbound_send(
+                inner.clone(),
+                session_id,
+                peer_eid,
+                peer_id,
+                paths,
+                pin,
+                addr,
+            )
+            .await
+            {
+                // Do not call `session_token` here: it inserts a fresh session if
+                // `cancel_one` already removed this id.
+                let cancelled = is_cancel_err(&e);
+                inner.finish_session_streams(session_id).await;
+                if !cancelled {
+                    let _ = inner.events.send(NodeEvent::TransferFailed {
                         session_id: session_id.to_string(),
+                        error: format!("{e:#}"),
                     });
-                    loop {
-                        match read_msg(&mut recv).await {
-                            Ok(msg) => {
-                                if inner.apply_outbound_wire(session_id, msg).await {
-                                    break;
-                                }
-                            }
-                            Err(_) => {
-                                info!(
-                                    "offer {session_id} stream dropped; keeping blobs until receiver reconnects"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(WireMsg::Decline { reason, .. }) => {
-                    inner.finish_session_streams(session_id).await;
-                    let _ = events.send(NodeEvent::TransferFailed {
-                        session_id: session_id.to_string(),
-                        error: format!("declined: {reason}"),
-                    });
-                }
-                Ok(WireMsg::Cancel { .. }) => {
-                    inner.finish_session_streams(session_id).await;
-                    let _ = events.send(NodeEvent::TransferFailed {
-                        session_id: session_id.to_string(),
-                        error: "cancelled".into(),
-                    });
-                }
-                Ok(other) => {
-                    inner.finish_session_streams(session_id).await;
-                    let _ = events.send(NodeEvent::TransferFailed {
-                        session_id: session_id.to_string(),
-                        error: format!("unexpected reply: {other:?}"),
-                    });
-                }
-                Err(e) => {
-                    let already = token.is_cancelled();
-                    inner.finish_session_streams(session_id).await;
-                    if !already {
-                        let _ = events.send(NodeEvent::TransferFailed {
-                            session_id: session_id.to_string(),
-                            error: format!("waiting for accept: {e:#}"),
-                        });
-                    }
                 }
             }
         });
@@ -1366,6 +1325,147 @@ impl Node {
     pub async fn shutdown(self) -> Result<()> {
         self.router.shutdown().await?;
         Ok(())
+    }
+}
+
+async fn run_outbound_send(
+    inner: Arc<NodeInner>,
+    session_id: Uuid,
+    peer_eid: EndpointId,
+    peer_id: String,
+    paths: Vec<PathBuf>,
+    pin: Option<String>,
+    addr: EndpointAddr,
+) -> Result<()> {
+    let token = inner.session_token(session_id).await;
+    let mut files = Vec::new();
+    for path in &paths {
+        if token.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        let tag = import_path(&inner.store, path, &token).await?;
+        let meta = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("stat {} after import (file vanished?)", path.display()))?;
+        files.push(FileOffer {
+            name: path
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("file"))
+                .to_string_lossy()
+                .into(),
+            size: meta.len(),
+            hash: tag.to_string(),
+        });
+    }
+    if token.is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
+    let bytes_total: u64 = files.iter().map(|f| f.size).sum();
+    inner.touch_session(session_id, bytes_total).await;
+    inner.register_send_blobs(session_id, &files).await;
+    inner.set_session_peer(session_id, peer_eid).await;
+    info!(
+        peer = %peer_id,
+        addrs = ?addr.addrs,
+        "connecting to send offer {session_id}"
+    );
+    let conn = connect_offer(&inner, peer_eid, &peer_id, addr, &token).await?;
+    if token.is_cancelled() {
+        conn.close(0u32.into(), b"cancelled");
+        anyhow::bail!("cancelled");
+    }
+    let (mut send, mut recv) = conn.open_bi().await.context("open stream")?;
+    write_msg(
+        &mut send,
+        &WireMsg::Offer {
+            session_id,
+            alias: inner.config.alias.clone(),
+            files: files.clone(),
+            pin,
+            metered_policy: inner.config.metered_policy,
+        },
+    )
+    .await?;
+    inner.offer_send.lock().await.insert(session_id, send);
+    inner
+        .offer_conn
+        .lock()
+        .await
+        .insert(session_id, conn.clone());
+    inner
+        .emit_progress(session_id, 0, bytes_total, TransferPath::Unknown, true)
+        .await;
+    let events = inner.events.clone();
+    loop {
+        let outcome = tokio::select! {
+            _ = token.cancelled() => {
+                anyhow::bail!("cancelled");
+            }
+            outcome = read_msg(&mut recv) => outcome,
+        };
+        match outcome {
+            Ok(WireMsg::Accept { .. }) => {
+                info!("offer {session_id} accepted; serving blobs");
+                watch_paths(conn.clone(), inner.clone(), session_id);
+                inner.remember_live_paths(&conn).await;
+                let _ = events.send(NodeEvent::OfferAccepted {
+                    session_id: session_id.to_string(),
+                });
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => anyhow::bail!("cancelled"),
+                        msg = read_msg(&mut recv) => match msg {
+                            Ok(m) => {
+                                if inner.apply_outbound_wire(session_id, m).await {
+                                    return Ok(());
+                                }
+                            }
+                            Err(_) => {
+                                if token.is_cancelled() {
+                                    anyhow::bail!("cancelled");
+                                }
+                                info!(
+                                    "offer {session_id} stream dropped; keeping blobs until receiver reconnects"
+                                );
+                                return Ok(());
+                            }
+                        },
+                    }
+                }
+            }
+            Ok(WireMsg::Decline { reason, .. }) => {
+                inner.finish_session_streams(session_id).await;
+                let _ = events.send(NodeEvent::TransferFailed {
+                    session_id: session_id.to_string(),
+                    error: format!("declined: {reason}"),
+                });
+                return Ok(());
+            }
+            Ok(WireMsg::Cancel { .. }) => {
+                inner.finish_session_streams(session_id).await;
+                let _ = events.send(NodeEvent::TransferFailed {
+                    session_id: session_id.to_string(),
+                    error: "cancelled".into(),
+                });
+                return Ok(());
+            }
+            Ok(other) => {
+                inner.finish_session_streams(session_id).await;
+                let _ = events.send(NodeEvent::TransferFailed {
+                    session_id: session_id.to_string(),
+                    error: format!("unexpected reply: {other:?}"),
+                });
+                return Ok(());
+            }
+            Err(e) => {
+                let already = token.is_cancelled();
+                inner.finish_session_streams(session_id).await;
+                if already {
+                    anyhow::bail!("cancelled");
+                }
+                anyhow::bail!("waiting for accept: {e:#}");
+            }
+        }
     }
 }
 
@@ -1529,16 +1629,37 @@ fn is_cancel_err(e: &anyhow::Error) -> bool {
     format!("{e:#}").to_ascii_lowercase().contains("cancelled")
 }
 
-async fn import_path(store: &FsStore, path: &Path) -> Result<Hash> {
-    let abs = tokio::fs::canonicalize(path)
-        .await
-        .with_context(|| format!("cannot read {}", path.display()))?;
+async fn import_path(store: &FsStore, path: &Path, token: &CancellationToken) -> Result<Hash> {
+    let abs = tokio::fs::canonicalize(path).await.with_context(|| {
+        format!(
+            "cannot read {} (use the file picker; names with spaces must be a single path)",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        abs.is_file(),
+        "{} is not a regular file",
+        abs.display()
+    );
     let meta = tokio::fs::metadata(&abs).await?;
     info!(path = %abs.display(), bytes = meta.len(), "importing blob");
-    match store.blobs().add_path(&abs).await {
+    let add = store.blobs().add_path(&abs);
+    let tag = tokio::select! {
+        _ = token.cancelled() => anyhow::bail!("cancelled"),
+        r = add => r,
+    };
+    match tag {
         Ok(tag) => {
-            info!(hash = %tag.hash, "import done");
-            Ok(tag.hash)
+            let hash = tag.hash;
+            drop(tag);
+            let st = match store.blobs().status(hash).await {
+                Ok(BlobStatus::Complete { size }) => format!("complete:{size}"),
+                Ok(BlobStatus::Partial { size }) => format!("partial:{size:?}"),
+                Ok(_) => "other".into(),
+                Err(e) => format!("err:{e}"),
+            };
+            info!(hash = %hash, status = %st, "import done");
+            Ok(hash)
         }
         Err(e) => {
             let msg = format!("{e:#}");

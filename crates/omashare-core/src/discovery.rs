@@ -12,12 +12,22 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, warn};
 
+use crate::addrs::is_relay_hint;
 use crate::events::{DiscoverySource, NearbyPeer};
 use crate::protocol::{Presence, MULTICAST_ADDR};
 
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
 /// Must be longer than subnet-scan interval so peers do not flap in and out.
 const PEER_TTL: Duration = Duration::from_secs(45);
+/// Multicast announces every 2s; if LAN is silent this long, BLE may take over the source label.
+const LAN_LIVE: Duration = Duration::from_secs(10);
+
+struct PeerEntry {
+    peer: NearbyPeer,
+    seen: Instant,
+    lan_seen: Option<Instant>,
+    bt_seen: Option<Instant>,
+}
 
 #[derive(Clone)]
 pub struct Discovery {
@@ -27,18 +37,43 @@ pub struct Discovery {
 struct Inner {
     presence: RwLock<Presence>,
     port: u16,
-    peers: RwLock<HashMap<String, (NearbyPeer, Instant)>>,
+    peers: RwLock<HashMap<String, PeerEntry>>,
     rebind: Notify,
 }
 
-fn should_update_source(existing: DiscoverySource, new: DiscoverySource) -> bool {
-    match new {
-        DiscoverySource::Mdns => false,
-        DiscoverySource::Bluetooth => matches!(
-            existing,
-            DiscoverySource::Bluetooth | DiscoverySource::Manual
-        ),
-        _ => true,
+fn is_lan_source(source: DiscoverySource) -> bool {
+    matches!(
+        source,
+        DiscoverySource::Multicast
+            | DiscoverySource::Mdns
+            | DiscoverySource::SubnetScan
+            | DiscoverySource::NativeDnsSd
+    )
+}
+
+fn lan_is_live(lan_seen: Option<Instant>, now: Instant) -> bool {
+    lan_seen
+        .map(|t| now.duration_since(t) < LAN_LIVE)
+        .unwrap_or(false)
+}
+
+fn bt_is_live(bt_seen: Option<Instant>, now: Instant) -> bool {
+    bt_seen
+        .map(|t| now.duration_since(t) < PEER_TTL)
+        .unwrap_or(false)
+}
+
+fn keep_non_lan_addrs(addrs: &mut Vec<String>) {
+    addrs.retain(|a| is_relay_hint(a));
+}
+
+fn demote_stale_lan(entry: &mut PeerEntry, now: Instant) {
+    if !is_lan_source(entry.peer.source) || lan_is_live(entry.lan_seen, now) {
+        return;
+    }
+    if bt_is_live(entry.bt_seen, now) {
+        entry.peer.source = DiscoverySource::Bluetooth;
+        keep_non_lan_addrs(&mut entry.peer.addrs);
     }
 }
 
@@ -57,8 +92,11 @@ impl Discovery {
     pub async fn peers(&self) -> Vec<NearbyPeer> {
         let mut map = self.inner.peers.write().await;
         let now = Instant::now();
-        map.retain(|_, (_, seen)| now.duration_since(*seen) < PEER_TTL);
-        map.values().map(|(p, _)| p.clone()).collect()
+        map.retain(|_, e| now.duration_since(e.seen) < PEER_TTL);
+        for e in map.values_mut() {
+            demote_stale_lan(e, now);
+        }
+        map.values().map(|e| e.peer.clone()).collect()
     }
 
     pub async fn upsert(&self, mut peer: NearbyPeer) {
@@ -68,25 +106,65 @@ impl Discovery {
         }
         let mut map = self.inner.peers.write().await;
         let alias_lc = peer.alias.to_ascii_lowercase();
-        map.retain(|id, (p, _)| {
-            p.alias.to_ascii_lowercase() != alias_lc || *id == peer.endpoint_id
+        map.retain(|id, e| {
+            e.peer.alias.to_ascii_lowercase() != alias_lc || *id == peer.endpoint_id
         });
-        if let Some((existing, seen)) = map.get_mut(&peer.endpoint_id) {
+        let now = Instant::now();
+        let new_source = peer.source;
+        if let Some(existing) = map.get_mut(&peer.endpoint_id) {
             for a in peer.addrs.drain(..) {
-                if !existing.addrs.contains(&a) {
-                    existing.addrs.push(a);
+                if !existing.peer.addrs.contains(&a) {
+                    existing.peer.addrs.push(a);
                 }
             }
-            existing.alias = peer.alias;
-            existing.device_kind = peer.device_kind;
-            existing.pin_required = peer.pin_required;
-            if should_update_source(existing.source, peer.source) {
-                existing.source = peer.source;
+            existing.peer.alias = peer.alias;
+            existing.peer.device_kind = peer.device_kind;
+            existing.peer.pin_required = peer.pin_required;
+            existing.seen = now;
+            if is_lan_source(new_source) {
+                existing.lan_seen = Some(now);
+                existing.peer.source = new_source;
+            } else if new_source == DiscoverySource::Bluetooth {
+                existing.bt_seen = Some(now);
+                if !lan_is_live(existing.lan_seen, now) {
+                    existing.peer.source = DiscoverySource::Bluetooth;
+                    keep_non_lan_addrs(&mut existing.peer.addrs);
+                }
+            } else if new_source == DiscoverySource::Manual || !is_lan_source(existing.peer.source)
+            {
+                existing.peer.source = new_source;
             }
-            *seen = Instant::now();
         } else {
-            map.insert(peer.endpoint_id.clone(), (peer, Instant::now()));
+            let lan_seen = is_lan_source(new_source).then_some(now);
+            let bt_seen = (new_source == DiscoverySource::Bluetooth).then_some(now);
+            map.insert(
+                peer.endpoint_id.clone(),
+                PeerEntry {
+                    peer,
+                    seen: now,
+                    lan_seen,
+                    bt_seen,
+                },
+            );
         }
+    }
+
+    /// Wi-Fi is gone: drop LAN-only peers and demote dual-discovered rows to bluetooth.
+    pub async fn drop_lan_paths(&self) {
+        let mut map = self.inner.peers.write().await;
+        let now = Instant::now();
+        map.retain(|_, e| {
+            e.lan_seen = None;
+            keep_non_lan_addrs(&mut e.peer.addrs);
+            if bt_is_live(e.bt_seen, now) {
+                e.peer.source = DiscoverySource::Bluetooth;
+                true
+            } else if is_lan_source(e.peer.source) {
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub async fn presence(&self) -> Presence {
@@ -380,5 +458,72 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].endpoint_id, "id-new");
         assert_eq!(peers[0].alias, "Blackbird");
+    }
+
+    fn lan_peer(alias: &str, eid: &str) -> NearbyPeer {
+        NearbyPeer {
+            alias: alias.into(),
+            device_kind: DeviceKind::Mobile,
+            endpoint_id: eid.into(),
+            pin_required: false,
+            source: DiscoverySource::Multicast,
+            addrs: vec!["192.168.1.8:9".into()],
+        }
+    }
+
+    fn bt_peer(alias: &str, eid: &str) -> NearbyPeer {
+        NearbyPeer {
+            alias: alias.into(),
+            device_kind: DeviceKind::Mobile,
+            endpoint_id: eid.into(),
+            pin_required: false,
+            source: DiscoverySource::Bluetooth,
+            addrs: vec!["https://relay.example".into()],
+        }
+    }
+
+    fn disc() -> Discovery {
+        Discovery::new(
+            Presence {
+                alias: "me".into(),
+                device_kind: DeviceKind::Desktop,
+                endpoint_id: "self".into(),
+                pin_required: false,
+                addrs: vec![],
+            },
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn live_lan_not_overwritten_by_ble() {
+        let d = disc();
+        d.upsert(lan_peer("phone", "eid")).await;
+        d.upsert(bt_peer("phone", "eid")).await;
+        let peers = d.peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].source, DiscoverySource::Multicast);
+        assert!(peers[0].addrs.iter().any(|a| a.starts_with("192.168.")));
+    }
+
+    #[tokio::test]
+    async fn ble_takes_over_after_wifi_drop() {
+        let d = disc();
+        d.upsert(lan_peer("phone", "eid")).await;
+        d.upsert(bt_peer("phone", "eid")).await;
+        d.drop_lan_paths().await;
+        let peers = d.peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].source, DiscoverySource::Bluetooth);
+        assert!(!peers[0].addrs.iter().any(|a| a.starts_with("192.168.")));
+        assert!(peers[0].addrs.iter().any(|a| a.starts_with("https://")));
+    }
+
+    #[tokio::test]
+    async fn wifi_drop_removes_lan_only_peer() {
+        let d = disc();
+        d.upsert(lan_peer("phone", "eid")).await;
+        d.drop_lan_paths().await;
+        assert!(d.peers().await.is_empty());
     }
 }
