@@ -30,7 +30,7 @@ pub async fn run_agent(opts: AgentOpts) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let _ = opts.enable_ble;
     println!(
-        "omashare agent  {}  {}  auto-accept={}  socket {}",
+        "omashare  {}  {}  auto-accept={}  socket {}",
         node.alias(),
         node.endpoint_id(),
         opts.auto_accept,
@@ -99,7 +99,7 @@ async fn bind_socket() -> Result<UnixListener> {
     let path = socket_path();
     if path.exists() {
         if crate::ipc::agent_is_healthy().await {
-            anyhow::bail!("omashare agent already running ({})", path.display());
+            anyhow::bail!("omashare already running ({})", path.display());
         }
         tracing::warn!("removing stale socket {}", path.display());
         let _ = std::fs::remove_file(&path);
@@ -143,6 +143,7 @@ async fn handle_agent_event(
         NodeEvent::IncomingOffer {
             session_id,
             from_alias,
+            from_endpoint,
             files,
             ..
         } => {
@@ -154,7 +155,12 @@ async fn handle_agent_event(
                     .body(&format!("{from_alias} wants to send {}", names.join(", ")))
                     .show();
             }
-            if auto_accept {
+            // `--auto-accept` accepts everyone and does not write trusted.json.
+            // Otherwise accept only when this endpoint id is in the trust file.
+            if auto_accept || crate::trust::is_trusted(from_endpoint) {
+                if !auto_accept {
+                    tracing::info!(%session_id, %from_endpoint, "auto-accept trusted device");
+                }
                 if let Err(e) = node.accept_offer(session_id).await {
                     tracing::warn!("auto-accept failed: {e:#}");
                 }
@@ -300,6 +306,17 @@ async fn dispatch(node: &Node, auto_accept: bool, cmd: ClientCmd) -> Result<Serv
             Ok(ServerMsg::Ok { session_id })
         }
         ClientCmd::Attach { .. } => Ok(ServerMsg::Ok { session_id: None }),
+        ClientCmd::TrustList => Ok(ServerMsg::Trusted {
+            devices: crate::trust::load_default()?,
+        }),
+        ClientCmd::TrustAdd { endpoint_id, alias } => {
+            crate::trust::add_default(endpoint_id, alias)?;
+            Ok(ServerMsg::Ok { session_id: None })
+        }
+        ClientCmd::TrustRemove { endpoint_id } => {
+            crate::trust::remove_default(&endpoint_id)?;
+            Ok(ServerMsg::Ok { session_id: None })
+        }
     }
 }
 

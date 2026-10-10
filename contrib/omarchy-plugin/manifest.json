@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "aerorohit.omashare",
+  "name": "Omashare",
+  "version": "0.1.0",
+  "author": "aerorohit",
+  "license": "MIT",
+  "description": "start Omashare, accept and send files, trust devices",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omashare",
+    "description": "start Omashare, accept and send files, trust devices",
+    "category": "Network",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

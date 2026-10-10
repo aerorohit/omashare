@@ -1,7 +1,7 @@
 mod agent;
 mod ipc;
-mod listen;
 mod picker;
+mod trust;
 mod tui;
 
 #[cfg(target_os = "linux")]
@@ -49,25 +49,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Background node (discovery, offers, transfers, notifications).
-    Agent,
-    /// Alias of `agent`.
-    Daemon,
-    /// Nearby list, inbox, and progress (default).
-    Tui,
-    /// Interactive debug prompt; attaches to the agent when it is running.
-    Listen,
-    /// List nearby peers (agent).
+    /// List nearby peers.
     Nearby,
-    /// Agent identity and receive directory.
+    /// Identity and receive directory.
     Status,
-    /// Accept an incoming offer (agent).
+    /// Accept an incoming offer.
     Accept { session_id: String },
-    /// Decline an incoming offer (agent).
+    /// Decline an incoming offer.
     Decline { session_id: String },
-    /// Cancel a transfer (agent).
+    /// Cancel a transfer.
     Cancel { session_id: Option<String> },
-    /// Send files via the agent, or a one-shot node if the agent is down.
+    /// Trusted devices. These endpoint ids are auto-accepted.
+    Trust {
+        #[command(subcommand)]
+        cmd: TrustCmd,
+    },
+    /// Send files via the running node, or a one-shot node if it is down.
     Send {
         #[arg(required = true)]
         files: Vec<PathBuf>,
@@ -76,6 +73,16 @@ enum Commands {
         #[arg(long)]
         pin: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum TrustCmd {
+    /// List trusted devices.
+    List,
+    /// Trust an endpoint id, or exactly one nearby alias.
+    Add { endpoint_or_alias: String },
+    /// Remove a trusted device by endpoint id or alias.
+    Remove { endpoint_or_alias: String },
 }
 
 #[tokio::main]
@@ -94,15 +101,6 @@ async fn main() -> Result<()> {
 
     let config = node_config(&cli);
     match cli.command {
-        Some(Commands::Agent | Commands::Daemon) => {
-            agent::run_agent(agent::AgentOpts {
-                config,
-                auto_accept: cli.auto_accept,
-                enable_ble: !cli.no_ble,
-            })
-            .await?;
-        }
-        Some(Commands::Listen) => run_listen(config).await?,
         Some(Commands::Nearby) => run_agent_cmd(ClientCmd::Nearby).await?,
         Some(Commands::Status) => run_agent_cmd(ClientCmd::Status).await?,
         Some(Commands::Accept { session_id }) => {
@@ -114,16 +112,26 @@ async fn main() -> Result<()> {
         Some(Commands::Cancel { session_id }) => {
             run_agent_cmd(ClientCmd::Cancel { session_id }).await?;
         }
+        Some(Commands::Trust { cmd }) => run_trust(cmd).await?,
         Some(Commands::Send { files, to, pin }) => run_send(config, files, to, pin).await?,
-        Some(Commands::Tui) | None => run_tui(config).await?,
+        None => {
+            if std::io::stdout().is_terminal() {
+                run_tui(config, cli.auto_accept, !cli.no_ble).await?;
+            } else {
+                agent::run_agent(agent::AgentOpts {
+                    config,
+                    auto_accept: cli.auto_accept,
+                    enable_ble: !cli.no_ble,
+                })
+                .await?;
+            }
+        }
     }
     Ok(())
 }
 
 fn node_config(cli: &Cli) -> NodeConfig {
-    let data = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("omashare");
+    let data = trust::data_dir();
     let receive = cli
         .receive_dir
         .clone()
@@ -147,7 +155,7 @@ fn node_config(cli: &Cli) -> NodeConfig {
 async fn run_agent_cmd(cmd: ClientCmd) -> Result<()> {
     let mut client = IpcClient::connect()
         .await
-        .context("agent not running (start `omashare agent`)")?;
+        .context("omashare is not running (start `omashare`)")?;
     let msg = client.request(cmd).await?;
     match msg {
         ServerMsg::Nearby { peers } => {
@@ -185,41 +193,99 @@ async fn run_agent_cmd(cmd: ClientCmd) -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(config: NodeConfig) -> Result<()> {
-    if !std::io::stdout().is_terminal() {
-        anyhow::bail!("not a tty; use `omashare agent` or `omashare send`");
+async fn run_trust(cmd: TrustCmd) -> Result<()> {
+    match cmd {
+        TrustCmd::List => {
+            let devices = if let Some(mut client) = ipc::connect_if_running().await? {
+                trust_list_ipc(&mut client).await?
+            } else {
+                trust::load_default()?
+            };
+            print_trusted(&devices);
+        }
+        TrustCmd::Add { endpoint_or_alias } => {
+            if let Some(mut client) = ipc::connect_if_running().await? {
+                let peers = client.nearby().await?;
+                let (endpoint_id, alias) = trust::resolve_add(&peers, &endpoint_or_alias)?;
+                expect_ok(
+                    client
+                        .request(ClientCmd::TrustAdd {
+                            endpoint_id: endpoint_id.clone(),
+                            alias: alias.clone(),
+                        })
+                        .await?,
+                )?;
+                println!("trusted {alias}  {endpoint_id}");
+            } else {
+                let (endpoint_id, alias) = trust::resolve_add(&[], &endpoint_or_alias)
+                    .context("omashare is not running; pass an endpoint id, or start `omashare` to trust by alias")?;
+                trust::add_default(endpoint_id.clone(), alias.clone())?;
+                println!("trusted {alias}  {endpoint_id}");
+            }
+        }
+        TrustCmd::Remove { endpoint_or_alias } => {
+            if let Some(mut client) = ipc::connect_if_running().await? {
+                let devices = trust_list_ipc(&mut client).await?;
+                let endpoint_id = trust::resolve_remove(&devices, &endpoint_or_alias)?;
+                expect_ok(
+                    client
+                        .request(ClientCmd::TrustRemove {
+                            endpoint_id: endpoint_id.clone(),
+                        })
+                        .await?,
+                )?;
+                println!("removed {endpoint_id}");
+            } else {
+                let devices = trust::load_default()?;
+                let endpoint_id = trust::resolve_remove(&devices, &endpoint_or_alias)?;
+                trust::remove_default(&endpoint_id)?;
+                println!("removed {endpoint_id}");
+            }
+        }
     }
+    Ok(())
+}
+
+async fn trust_list_ipc(client: &mut IpcClient) -> Result<Vec<ipc::TrustedDevice>> {
+    match client.request(ClientCmd::TrustList).await? {
+        ServerMsg::Trusted { devices } => Ok(devices),
+        ServerMsg::Error { error } => anyhow::bail!("{error}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+fn expect_ok(msg: ServerMsg) -> Result<()> {
+    match msg {
+        ServerMsg::Ok { .. } => Ok(()),
+        ServerMsg::Error { error } => anyhow::bail!("{error}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+fn print_trusted(devices: &[ipc::TrustedDevice]) {
+    if devices.is_empty() {
+        println!("(no trusted devices)");
+        return;
+    }
+    for d in devices {
+        println!("{}  {}", d.alias, d.endpoint_id);
+    }
+}
+
+async fn run_tui(config: NodeConfig, auto_accept: bool, enable_ble: bool) -> Result<()> {
     if let Some(client) = ipc::connect_if_running().await? {
         return tui::run(client).await;
     }
     let embedded = agent::spawn_embedded_agent(agent::AgentOpts {
         config,
-        auto_accept: false,
-        enable_ble: true,
+        auto_accept,
+        enable_ble,
     })
     .await?;
     let client = IpcClient::connect()
         .await
         .context("attach to in-process node")?;
     let result = tui::run(client).await;
-    embedded.shutdown().await;
-    result
-}
-
-async fn run_listen(config: NodeConfig) -> Result<()> {
-    if let Some(client) = ipc::connect_if_running().await? {
-        return listen::run(client).await;
-    }
-    let embedded = agent::spawn_embedded_agent(agent::AgentOpts {
-        config,
-        auto_accept: false,
-        enable_ble: true,
-    })
-    .await?;
-    let client = IpcClient::connect()
-        .await
-        .context("attach to in-process node")?;
-    let result = listen::run(client).await;
     embedded.shutdown().await;
     result
 }
@@ -232,7 +298,7 @@ async fn run_send(
 ) -> Result<()> {
     if let Some(mut client) = ipc::connect_if_running().await? {
         println!(
-            "using agent  {}",
+            "using omashare  {}",
             match &client.hello {
                 ServerMsg::Hello { alias, .. } => alias.as_str(),
                 _ => "",

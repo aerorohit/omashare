@@ -1,13 +1,13 @@
 [Unit]
-Description=Omashare agent (Iroh LAN + relay)
+Description=Omashare node (Iroh LAN + relay)
 After=network-online.target bluetooth.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 # Install the binary to ~/.local/bin or change this path.
-# Auto-accept is off: incoming offers need the TUI or a notification + `omashare` accept.
-ExecStart=%h/.local/bin/omashare agent
+# The unit runs the node (no TTY). Offers need the TUI, the plugin, or `omashare accept`.
+ExecStart=%h/.local/bin/omashare
 Restart=on-failure
 RestartSec=2
 

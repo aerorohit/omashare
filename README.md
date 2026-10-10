@@ -1,12 +1,12 @@
 # Omashare
 
-AirDrop-like file send on [Iroh](https://iroh.computer). A background **agent** stays
-discoverable; a small **TUI** attaches to it. Nearby devices meet on the LAN
+AirDrop-like file send on [Iroh](https://iroh.computer). In a terminal, `omashare`
+is the TUI and the node. With no terminal it is the node only. Nearby devices meet on the LAN
 (multicast + HTTP subnet scan + mDNS) or over **Bluetooth** (GATT Presence
 handshake). After accept, bytes go over `iroh-blobs` on magicsock so the same
 transfer can keep going when Wi-Fi drops (hole punch, then n0 relay).
 
-Not LocalSend-compatible. No system VPN.
+No system VPN.
 
 This repo owns the protocol, Rust core, UniFFI surface, and Linux client.
 The Android UI lives in the sibling repo [`omashare-android`](../omashare-android).
@@ -15,27 +15,38 @@ The Android UI lives in the sibling repo [`omashare-android`](../omashare-androi
 
 ```bash
 cargo build -p omashare --release
-# Background node (auto-accept off). Notifications for incoming offers.
-./target/release/omashare agent
-# TUI: nearby list, inbox, progress. Attaches to the agent if it is running.
+# In a terminal: the TUI and the node. Attaches if a node is already listening;
+# otherwise starts one and shuts it down when the TUI exits.
 ./target/release/omashare
-# or: ./target/release/omashare tui
-# Send via the agent (or a one-shot node if the agent is down)
+# With no terminal (the plugin or the systemd unit): the node only.
+# Send via the running node (or a one-shot node if it is down)
 ./target/release/omashare send photo.jpg --to other-laptop
 # Cancel the current transfer (omit the id to cancel every open session)
 ./target/release/omashare cancel
 ./target/release/omashare cancel SESSION_ID
+# Accept or decline an offer on the running node
+./target/release/omashare accept SESSION_ID
+./target/release/omashare decline SESSION_ID
+# Trust list / add / remove. Trusted peers are auto-accepted.
+./target/release/omashare trust list
+./target/release/omashare trust add ENDPOINT_OR_ALIAS
+./target/release/omashare trust remove ENDPOINT_OR_ALIAS
 ```
 
-Incoming files go to `~/Downloads/omashare`. `--offline` skips n0 relays (LAN only). `--pin 1234` requires senders to pass that PIN. `--auto-accept` is for kiosks and tests only. `--no-ble` skips Bluetooth discovery (BlueZ).
+Incoming files go to `~/Downloads/omashare`. `--offline` skips n0 relays (LAN only). `--pin 1234` requires senders to pass that PIN. `--auto-accept` is for kiosks and tests only and does not write the trust file. Trusted endpoint ids in `$XDG_DATA_HOME/omashare/trusted.json` are auto-accepted. `--no-ble` skips Bluetooth discovery (BlueZ).
 
 The TUI opens the native file manager (xdg-desktop-portal, then zenity) for **s** / search. It does not browse files itself. **c** cancels the in-progress transfer.
 
-User systemd unit: copy [`contrib/omashare.service`](contrib/omashare.service) to `~/.config/systemd/user/`, put the binary on `~/.local/bin/omashare`, then `systemctl --user enable --now omashare`. The unit runs `omashare agent` (consent required).
+User systemd unit: copy [`contrib/omashare.service`](contrib/omashare.service) to `~/.config/systemd/user/`, put the binary on `~/.local/bin/omashare`, then `systemctl --user enable --now omashare`. The unit runs `omashare` with no terminal, so it is the node only. Offers need the TUI, the plugin, or `omashare accept`.
 
 IPC: `$XDG_RUNTIME_DIR/omashare.sock` (JSON lines). One Iroh endpoint per machine.
 
-Walk-away test: start `omashare agent`, send a few MB from the phone, turn Wi-Fi off with mobile data on. Progress should continue; logs show `path=relay` (or WAN).
+Omarchy bar plugin: [`contrib/omarchy-plugin`](contrib/omarchy-plugin) (`aerorohit.omashare`).
+Copy that folder to `~/.config/omarchy/plugins/aerorohit.omashare`.
+The panel uses the installed `omashare` on `PATH`. It starts the node when the socket is missing, and does not start a second node when the socket is already there.
+It lists nearby devices, accepts or declines offers, sends files you pick, and toggles trust.
+
+Walk-away test: start `omashare` with no terminal (or the systemd unit), send a few MB from the phone, turn Wi-Fi off with mobile data on. Progress should continue; logs show `path=relay` (or WAN).
 
 ## Android
 

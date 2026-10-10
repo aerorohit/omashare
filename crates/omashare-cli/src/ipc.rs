@@ -41,6 +41,20 @@ pub enum ClientCmd {
         #[serde(default)]
         kind: ClientKind,
     },
+    TrustList,
+    TrustAdd {
+        endpoint_id: String,
+        alias: String,
+    },
+    TrustRemove {
+        endpoint_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedDevice {
+    pub endpoint_id: String,
+    pub alias: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +89,9 @@ pub enum ServerMsg {
     },
     Error {
         error: String,
+    },
+    Trusted {
+        devices: Vec<TrustedDevice>,
     },
 }
 
@@ -144,7 +161,8 @@ impl IpcClient {
                     msg @ (ServerMsg::Ok { .. }
                     | ServerMsg::Error { .. }
                     | ServerMsg::Nearby { .. }
-                    | ServerMsg::Status { .. }),
+                    | ServerMsg::Status { .. }
+                    | ServerMsg::Trusted { .. }),
                 )) => {
                     return Ok(msg);
                 }
@@ -190,6 +208,44 @@ pub async fn connect_if_running() -> Result<Option<IpcClient>> {
     match tokio::time::timeout(Duration::from_millis(500), IpcClient::connect()).await {
         Ok(Ok(c)) => Ok(Some(c)),
         Ok(Err(_)) | Err(_) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trust_ipc_shapes() {
+        assert_eq!(
+            serde_json::to_string(&ClientCmd::TrustList).unwrap(),
+            r#"{"cmd":"trust_list"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientCmd::TrustAdd {
+                endpoint_id: "abc".into(),
+                alias: "phone".into(),
+            })
+            .unwrap(),
+            r#"{"cmd":"trust_add","endpoint_id":"abc","alias":"phone"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientCmd::TrustRemove {
+                endpoint_id: "abc".into(),
+            })
+            .unwrap(),
+            r#"{"cmd":"trust_remove","endpoint_id":"abc"}"#
+        );
+        let msg = ServerMsg::Trusted {
+            devices: vec![TrustedDevice {
+                endpoint_id: "abc".into(),
+                alias: "phone".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"type":"trusted","devices":[{"endpoint_id":"abc","alias":"phone"}]}"#
+        );
     }
 }
 
