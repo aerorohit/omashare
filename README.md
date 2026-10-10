@@ -1,70 +1,75 @@
 # Omashare
 
-AirDrop-like file send on [Iroh](https://iroh.computer). In a terminal, `omashare`
-is the TUI and the node. With no terminal it is the node only. Nearby devices meet on the LAN
-(multicast + HTTP subnet scan + mDNS) or over **Bluetooth** (GATT Presence
-handshake). After accept, bytes go over `iroh-blobs` on magicsock so the same
-transfer can keep going when Wi-Fi drops (hole punch, then n0 relay).
+Send files between Linux and Android on the local network, with a relay fallback when Wi-Fi drops. One command, `omashare`, is the TUI and the node. Not LocalSend-compatible. No VPN.
 
-No system VPN.
+## Installation
 
-This repo owns the protocol, Rust core, UniFFI surface, and Linux client.
-The Android UI lives in the sibling repo [`omashare-android`](../omashare-android).
-
-## Linux
+Requires Rust (stable) and Linux.
 
 ```bash
-cargo build -p omashare --release
-# In a terminal: the TUI and the node. Attaches if a node is already listening;
-# otherwise starts one and shuts it down when the TUI exits.
-./target/release/omashare
-# With no terminal (the plugin or the systemd unit): the node only.
-# Send via the running node (or a one-shot node if it is down)
-./target/release/omashare send photo.jpg --to other-laptop
-# Cancel the current transfer (omit the id to cancel every open session)
-./target/release/omashare cancel
-./target/release/omashare cancel SESSION_ID
-# Accept or decline an offer on the running node
-./target/release/omashare accept SESSION_ID
-./target/release/omashare decline SESSION_ID
-# Trust list / add / remove. Trusted peers are auto-accepted.
-./target/release/omashare trust list
-./target/release/omashare trust add ENDPOINT_OR_ALIAS
-./target/release/omashare trust remove ENDPOINT_OR_ALIAS
+git clone https://github.com/aerorohit/omashare && cd omashare
+cargo build --release -p omashare
+install -Dm755 target/release/omashare ~/.local/bin/omashare
 ```
 
-Incoming files go to `~/Downloads/omashare`. `--offline` skips n0 relays (LAN only). `--pin 1234` requires senders to pass that PIN. `--auto-accept` is for kiosks and tests only and does not write the trust file. Trusted endpoint ids in `$XDG_DATA_HOME/omashare/trusted.json` are auto-accepted. `--no-ble` skips Bluetooth discovery (BlueZ).
+`~/.local/bin` must be on `PATH`.
 
-The TUI opens the native file manager (xdg-desktop-portal, then zenity) for **s** / search. It does not browse files itself. **c** cancels the in-progress transfer.
+`omashare` in a terminal starts the TUI. With no terminal the same binary stays up as the node. If a node is already running, the TUI attaches to it.
 
-User systemd unit: copy [`contrib/omashare.service`](contrib/omashare.service) to `~/.config/systemd/user/`, put the binary on `~/.local/bin/omashare`, then `systemctl --user enable --now omashare`. The unit runs `omashare` with no terminal, so it is the node only. Offers need the TUI, the plugin, or `omashare accept`.
+## Commands
 
-IPC: `$XDG_RUNTIME_DIR/omashare.sock` (JSON lines). One Iroh endpoint per machine.
+```bash
+omashare send photo.jpg --to other-laptop
+omashare cancel
+omashare cancel SESSION_ID
+omashare accept SESSION_ID
+omashare decline SESSION_ID
+omashare trust list
+omashare trust add ENDPOINT_OR_ALIAS
+omashare trust remove ENDPOINT_OR_ALIAS
+```
 
-Omarchy bar plugin: [`contrib/omarchy-plugin`](contrib/omarchy-plugin) (`aerorohit.omashare`).
-Copy that folder to `~/.config/omarchy/plugins/aerorohit.omashare`.
-The panel uses the installed `omashare` on `PATH`. It starts the node when the socket is missing, and does not start a second node when the socket is already there.
-It lists nearby devices, accepts or declines offers, sends files you pick, and toggles trust.
+`send` uses the running node, or a one-shot node if it is down. `cancel` with no id cancels every open session. `trust add` takes an endpoint id, or exactly one nearby alias.
 
-Walk-away test: start `omashare` with no terminal (or the systemd unit), send a few MB from the phone, turn Wi-Fi off with mobile data on. Progress should continue; logs show `path=relay` (or WAN).
+Incoming files go to `~/Downloads/omashare`.
+
+`--offline` skips relays and stays on the LAN. `--pin 1234` requires senders to pass that PIN. `--no-ble` skips Bluetooth discovery. `--auto-accept` is for kiosks only and does not write the trust file.
+
+Trusted devices auto-accept and live in `$XDG_DATA_HOME/omashare/trusted.json`.
+
+## TUI
+
+```
+[s] send   [enter] send to selected   [t] trust   [a] accept   [d] decline   [c] cancel   [q] quit
+```
+
+`j` / `k` (or the arrow keys) move the selection. `s` opens the native file manager (xdg-desktop-portal, then zenity). `enter` sends the picked files to the selected device. `t` trusts or untrusts that device. `a` and `d` accept or decline an incoming offer. `c` cancels the transfer. `q` quits.
+
+TUI logs go to `$XDG_DATA_HOME/omashare/omashare.log`, not the screen.
+
+## systemd
+
+Optional. Copy [`contrib/omashare.service`](contrib/omashare.service) to `~/.config/systemd/user/`. The unit starts `~/.local/bin/omashare`.
+
+```bash
+systemctl --user enable --now omashare
+```
+
+The unit has no terminal, so it is the node only. Accept offers from the TUI, the plugin, or `omashare accept`.
+
+## Omarchy plugin
+
+Optional. Omashare does not require Omarchy.
+
+If you use Omarchy and `omashare` is already on `PATH`, copy [`contrib/omarchy-plugin`](contrib/omarchy-plugin) to `~/.config/omarchy/plugins/aerorohit.omashare` and enable Omashare on the bar. The plugin only talks to the installed `omashare` binary.
 
 ## Android
 
-Use the sibling repo `../omashare-android`. Core is the same Rust crate via UniFFI
-(`crates/omashare-ffi`). From that repo, generate bindings and a `jniLibs` `.so` with NDK:
-
-```bash
-cargo run -p omashare-ffi --bin uniffi-bindgen -- generate \
-  --library target/release/libomashare_ffi.so \
-  --language kotlin \
-  --out-dir ../omashare-android/app/src/main/java
-# cargo ndk -t arm64-v8a build -p omashare-ffi --release
-```
+The Android app is a separate repo: [github.com/aerorohit/omashare-android](https://github.com/aerorohit/omashare-android). It uses the same protocol. Build instructions live in that repo.
 
 ## Protocol
 
 - Discovery UDP/TCP port **53318**, multicast `224.0.0.169`, HTTP `GET /omashare/info`
-- BLE discovery: service UUID `6f6d6173-6861-7265-0000-000000005318`, GATT
-  Presence JSON on `…5319`. Handshake only; files still go LAN / WAN / n0 relay.
+- BLE discovery: service UUID `6f6d6173-6861-7265-0000-000000005318`, GATT Presence JSON on `…5319`. Handshake only; files still go LAN / WAN / n0 relay.
 - Offer ALPN `omashare/offer/0`
 - Payload ALPN `iroh-blobs`

@@ -133,13 +133,13 @@ Library: **ratatui** + crossterm. One screen, no settings maze.
 ```
   omashare  ·  hostname  ·  listening
   ────────────────────────────────────
-  Nearby                         Inbox
-  ● phone-pixel     mobile       (empty)
-  ● other-laptop    desktop
+  Nearby
+  ● phone-pixel     trusted   mobile
+    other-laptop              desktop
   ────────────────────────────────────
   transfer  photo.jpg  12.4 / 40 MB  31%  LAN
   ────────────────────────────────────
-  [s] send   [enter] send to selected   [a] accept   [d] decline   [q] quit
+  [s] send   [enter] send to selected   [t] trust   [a] accept   [d] decline   [c] cancel   [q] quit
 ```
 
 Behavior:

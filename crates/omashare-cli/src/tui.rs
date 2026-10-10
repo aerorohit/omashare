@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::ipc::{AgentLine, ClientCmd, IpcClient, ServerMsg};
+use crate::ipc::{AgentLine, ClientCmd, IpcClient, ServerMsg, TrustedDevice};
 
 struct Offer {
     session_id: String,
@@ -29,12 +30,19 @@ struct Progress {
     path: TransferPath,
 }
 
+struct PendingTrust {
+    endpoint_id: String,
+    alias: String,
+}
+
 struct Ui {
     alias: String,
     endpoint_id: String,
     peers: Vec<NearbyPeer>,
     selected: usize,
-    inbox: Vec<Offer>,
+    trusted: HashSet<String>,
+    pending_trust: Option<PendingTrust>,
+    offer: Option<Offer>,
     progress: Option<Progress>,
     picked: Vec<PathBuf>,
     status: String,
@@ -54,7 +62,9 @@ impl Ui {
             endpoint_id,
             peers: Vec::new(),
             selected: 0,
-            inbox: Vec::new(),
+            trusted: HashSet::new(),
+            pending_trust: None,
+            offer: None,
             progress: None,
             picked: Vec::new(),
             status: String::new(),
@@ -64,6 +74,42 @@ impl Ui {
 
     fn selected_peer(&self) -> Option<&NearbyPeer> {
         self.peers.get(self.selected)
+    }
+
+    fn replace_trusted(&mut self, devices: Vec<TrustedDevice>) {
+        self.trusted = devices.into_iter().map(|d| d.endpoint_id).collect();
+        let Some(pending) = self.pending_trust.take() else {
+            return;
+        };
+        if self.trusted.contains(&pending.endpoint_id) {
+            self.status = format!("trusted {}", pending.alias);
+        } else {
+            self.status = format!("untrusted {}", pending.alias);
+        }
+    }
+
+    fn set_offer(&mut self, session_id: String, from_alias: String, files: Vec<FileOffer>) {
+        let replace = self
+            .offer
+            .as_ref()
+            .is_none_or(|o| o.session_id == session_id);
+        if replace {
+            self.offer = Some(Offer {
+                session_id,
+                from_alias,
+                files,
+            });
+        }
+    }
+
+    fn clear_offer(&mut self, session_id: &str) {
+        if self
+            .offer
+            .as_ref()
+            .is_some_and(|o| o.session_id == session_id)
+        {
+            self.offer = None;
+        }
     }
 
     fn apply_event(&mut self, ev: NodeEvent) {
@@ -79,17 +125,10 @@ impl Ui {
                 from_alias,
                 files,
                 ..
-            } => {
-                self.inbox.retain(|o| o.session_id != session_id);
-                self.inbox.push(Offer {
-                    session_id,
-                    from_alias,
-                    files,
-                });
-            }
+            } => self.set_offer(session_id, from_alias, files),
             NodeEvent::OfferResolved { session_id, .. }
             | NodeEvent::OfferAccepted { session_id } => {
-                self.inbox.retain(|o| o.session_id != session_id);
+                self.clear_offer(&session_id);
             }
             NodeEvent::TransferProgress {
                 session_id,
@@ -122,7 +161,7 @@ impl Ui {
                 session_id,
                 saved_to,
             } => {
-                self.inbox.retain(|o| o.session_id != session_id);
+                self.clear_offer(&session_id);
                 self.progress = None;
                 self.status = match saved_to {
                     Some(p) => format!("done → {p}"),
@@ -130,7 +169,7 @@ impl Ui {
                 };
             }
             NodeEvent::TransferFailed { session_id, error } => {
-                self.inbox.retain(|o| o.session_id != session_id);
+                self.clear_offer(&session_id);
                 self.progress = None;
                 self.status = format!("fail: {error}");
             }
@@ -144,6 +183,9 @@ pub async fn run(mut client: IpcClient) -> Result<()> {
     let _ = client.attach_tui().await;
     if let Ok(peers) = client.nearby().await {
         ui.peers = peers;
+    }
+    if let Ok(ServerMsg::Trusted { devices }) = client.request(ClientCmd::TrustList).await {
+        ui.replace_trusted(devices);
     }
 
     let mut terminal = ratatui::init();
@@ -179,7 +221,11 @@ async fn event_loop(
                             ui.selected = ui.peers.len().saturating_sub(1);
                         }
                     }
+                    Some(AgentLine::Server(ServerMsg::Trusted { devices })) => {
+                        ui.replace_trusted(devices);
+                    }
                     Some(AgentLine::Server(ServerMsg::Error { error })) => {
+                        ui.pending_trust = None;
                         ui.status = error;
                     }
                     Some(AgentLine::Server(ServerMsg::Ok { session_id })) => {
@@ -231,24 +277,23 @@ async fn handle_key(
             }
             send_to_selected(client, ui).await?;
         }
+        KeyCode::Char('t') => {
+            toggle_trust(client, ui).await?;
+        }
         KeyCode::Char('a') => {
-            if let Some(offer) = ui.inbox.first() {
+            if let Some(offer) = &ui.offer {
                 let id = offer.session_id.clone();
                 client
                     .send_cmd(&ClientCmd::Accept { session_id: id })
                     .await?;
-            } else {
-                ui.status = "no incoming offer".into();
             }
         }
         KeyCode::Char('d') => {
-            if let Some(offer) = ui.inbox.first() {
+            if let Some(offer) = &ui.offer {
                 let id = offer.session_id.clone();
                 client
                     .send_cmd(&ClientCmd::Decline { session_id: id })
                     .await?;
-            } else {
-                ui.status = "no incoming offer".into();
             }
         }
         KeyCode::Char('c') => {
@@ -256,7 +301,7 @@ async fn handle_key(
                 .progress
                 .as_ref()
                 .map(|p| p.session_id.clone())
-                .or_else(|| ui.inbox.first().map(|o| o.session_id.clone()));
+                .or_else(|| ui.offer.as_ref().map(|o| o.session_id.clone()));
             client
                 .send_cmd(&ClientCmd::Cancel { session_id: id })
                 .await?;
@@ -264,6 +309,33 @@ async fn handle_key(
         }
         _ => {}
     }
+    Ok(())
+}
+
+async fn toggle_trust(client: &mut IpcClient, ui: &mut Ui) -> Result<()> {
+    if ui.pending_trust.is_some() {
+        return Ok(());
+    }
+    let Some(peer) = ui.selected_peer() else {
+        ui.status = "no peer selected".into();
+        return Ok(());
+    };
+    let endpoint_id = peer.endpoint_id.clone();
+    let alias = peer.alias.clone();
+    let add = !ui.trusted.contains(&endpoint_id);
+    let cmd = if add {
+        ClientCmd::TrustAdd {
+            endpoint_id: endpoint_id.clone(),
+            alias: alias.clone(),
+        }
+    } else {
+        ClientCmd::TrustRemove {
+            endpoint_id: endpoint_id.clone(),
+        }
+    };
+    ui.pending_trust = Some(PendingTrust { endpoint_id, alias });
+    client.send_cmd(&cmd).await?;
+    client.send_cmd(&ClientCmd::TrustList).await?;
     Ok(())
 }
 
@@ -316,11 +388,6 @@ fn draw(frame: &mut Frame, ui: &Ui) {
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(chunks[1]);
-
     let items: Vec<ListItem> = if ui.peers.is_empty() {
         vec![ListItem::new("  (searching…)")]
     } else {
@@ -329,31 +396,20 @@ fn draw(frame: &mut Frame, ui: &Ui) {
             .enumerate()
             .map(|(i, p)| {
                 let mark = if i == ui.selected { "●" } else { " " };
+                let trust = if ui.trusted.contains(&p.endpoint_id) {
+                    "trusted"
+                } else {
+                    ""
+                };
                 let kind = kind_label(p.device_kind);
                 let src = source_label(p.source);
-                ListItem::new(format!("{mark} {:<18} {kind:<8} {src}", p.alias))
+                ListItem::new(format!("{mark} {:<18} {trust:<8} {kind:<8} {src}", p.alias))
             })
             .collect()
     };
     frame.render_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title("Nearby")),
-        body[0],
-    );
-
-    let inbox_items: Vec<ListItem> = if ui.inbox.is_empty() {
-        vec![ListItem::new("(empty)")]
-    } else {
-        ui.inbox
-            .iter()
-            .map(|o| {
-                let names: Vec<_> = o.files.iter().map(|f| f.name.as_str()).collect();
-                ListItem::new(format!("{}: {}", o.from_alias, names.join(", ")))
-            })
-            .collect()
-    };
-    frame.render_widget(
-        List::new(inbox_items).block(Block::default().borders(Borders::ALL).title("Inbox")),
-        body[1],
+        chunks[1],
     );
 
     let progress = if let Some(p) = &ui.progress {
@@ -379,11 +435,13 @@ fn draw(frame: &mut Frame, ui: &Ui) {
     );
 
     frame.render_widget(
-        Paragraph::new("[s] send   [enter] send to selected   [a] accept   [d] decline   [c] cancel   [q] quit"),
+        Paragraph::new(
+            "[s] send   [enter] send to selected   [t] trust   [a] accept   [d] decline   [c] cancel   [q] quit",
+        ),
         chunks[3],
     );
 
-    if let Some(offer) = ui.inbox.first() {
+    if let Some(offer) = &ui.offer {
         draw_modal(frame, offer);
     }
 }

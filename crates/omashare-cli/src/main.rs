@@ -128,7 +128,11 @@ async fn main() -> Result<()> {
 /// TUI sessions log to `$XDG_DATA_HOME/omashare/omashare.log` so tracing
 /// does not paint over the alternate screen. Headless runs stay on stderr.
 fn init_tracing(verbose: bool, to_file: bool) -> Result<Option<PathBuf>> {
-    let directive = if verbose { "omashare=debug" } else { "omashare=info" };
+    let directive = if verbose {
+        "omashare=debug"
+    } else {
+        "omashare=info"
+    };
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive(directive.parse().context("log filter")?);
     if !to_file {
