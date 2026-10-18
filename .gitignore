@@ -4,8 +4,7 @@
 *.pdb
 
 # Local cargo home if CARGO_HOME is (or was) the repo
-.cargo/registry/
-.cargo/git/
+.cargo/
 
 # Native / UniFFI artifacts generated in-tree
 *.so
